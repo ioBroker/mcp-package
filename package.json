@@ -6,6 +6,9 @@
     "name": "ioBroker",
     "email": "info@iobroker.net"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "homepage": "https://github.com/ioBroker/mpc-package",
   "license": "MIT",
   "keywords": [
