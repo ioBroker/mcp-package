@@ -40,11 +40,33 @@ The adapter can be configured through the ioBroker admin interface using JSONCon
 - **Bind Address**: IP address to bind the server to (0.0.0.0 for all interfaces) – standalone only
 
 ### Authentication
-- **Enable Authentication**: Enable ioBroker user authentication for the web server
+- **Enable Authentication**: When enabled (standalone mode), every request to the `/mcp` endpoint must
+  present valid ioBroker credentials, otherwise it is rejected with `401 Unauthorized`. When disabled, the
+  endpoint is reachable without credentials — only use that on a trusted network or behind a reverse proxy
+  that provides its own authentication. As a **web extension** the host `web` instance's authentication
+  applies instead, so this switch has no effect there.
 - **Default User**: The ioBroker user whose permissions every MCP request runs with (default: `admin`).
   All object/state reads and writes performed by the tools are executed in the name of this user, so the
   user's ACLs are enforced. A plain name like `operator` is automatically expanded to `system.user.operator`.
   When running as a web extension and no user is set here, the host `web` instance's default user is used.
+
+#### Authenticating a client (standalone, when authentication is enabled)
+Clients may authenticate in either of two ways:
+
+- **HTTP Basic auth** — send an `Authorization: Basic <base64(user:password)>` header with every request
+  (e.g. `curl -u mcpserver:secret ...`). Simplest for headless/script clients.
+- **Bearer access token** — obtain a token once and send it as `Authorization: Bearer <access_token>`:
+
+  ```bash
+  curl -X POST https://HOST:PORT/oauth/token \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    -d 'grant_type=password&username=mcpserver&password=secret'
+  # → { "access_token": "...", "token_type": "Bearer", "expires_in": 3600, "refresh_token": "..." }
+  ```
+
+Note that authentication only gates *access* to the endpoint; the tools still run with the **Default User's**
+permissions regardless of which user authenticated. Give the Default User an ioBroker account with exactly
+the ACLs the MCP client should have.
 
 ### Permissions
 - **Allow setting states**: Allow MCP clients to write state values (the `set_state` and `set_states` tools).
@@ -135,6 +157,11 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Fixed authentication: with "Enable Authentication" on, the standalone MCP endpoint now
+  requires valid ioBroker credentials (Bearer token or HTTP Basic auth) and rejects anonymous requests with
+  `401 Unauthorized` (#44)
+
 ### 0.0.2 (2026-06-17)
 * (@GermanBluefox) Initial development
 

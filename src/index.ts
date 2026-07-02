@@ -1,4 +1,4 @@
-import express, { type Express, type Request, type Response, type NextFunction } from 'express';
+import express, { type Express, type Request, type RequestHandler, type Response, type NextFunction } from 'express';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import net from 'node:net';
@@ -13,6 +13,7 @@ import {
     SubscribeRequestSchema,
     UnsubscribeRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import { createOAuth2Server, type OAuth2Model } from '@iobroker/webserver';
 import { getAiFriendlyStructure, type Room } from './devices';
 import { iobUriParse } from './iob-uri';
 import type { McpConfig } from './types';
@@ -29,6 +30,13 @@ type ToolResult = {
     content: { type: 'text'; text: string }[];
     isError?: boolean;
 };
+
+/**
+ * Express request after the shared ioBroker OAuth2 `authorize` middleware ran. `user` holds the
+ * plain ioBroker user name (without the `system.user.` prefix) when a valid credential — a Bearer
+ * access token, an `access_token` cookie, or HTTP Basic auth — was presented; otherwise it is unset.
+ */
+type AuthenticatedRequest = Request & { user?: string };
 
 /** Map the human-friendly aggregation names from the manifest to ioBroker history values. */
 const AGG_MAP: Record<string, ioBroker.GetHistoryOptions['aggregate']> = {
@@ -131,6 +139,13 @@ export default class McpServer {
     private readonly defaultUser: `system.user.${string}`;
     /** Default language used to localize device/room/function names. */
     private readonly language: ioBroker.Languages;
+    /**
+     * Whether this instance has to authenticate incoming MCP requests itself. True only in standalone
+     * mode with authentication enabled; as a web extension the host `web` adapter guards the routes.
+     */
+    private readonly authRequired: boolean;
+    /** OAuth2 login/token server, created only when {@link authRequired} is true. */
+    private oauth2?: OAuth2Model;
 
     constructor(
         server: HttpServer | HttpsServer | null,
@@ -182,6 +197,12 @@ export default class McpServer {
         // Permission toggles: state writes are allowed by default, object/file changes are not.
         this.config.allowSetState = this.config.allowSetState !== false;
         this.config.allowObjectChange = this.config.allowObjectChange === true;
+
+        // Authentication is enforced by us only when we run standalone (we own the Express app) and
+        // the user turned it on. As a web extension (`this.extension`) the host `web` adapter already
+        // authenticates every request before it reaches our routes, and in embedded in-process mode
+        // there is no HTTP layer at all (`this.app` is undefined).
+        this.authRequired = !this.extension && !!this.app && !!this.config.auth;
 
         // Receive ioBroker log messages (only forwarded once a session subscribes via requireLog).
         this.adapter.on('log', this.onLog);
@@ -286,14 +307,44 @@ export default class McpServer {
             });
         }
 
+        // --- Authentication (standalone mode only) ---
+        // As a web extension the host `web` adapter owns authentication for every route (ours
+        // included), so installing a second OAuth2 server here would clash with it. When we run
+        // standalone and the user enabled authentication, protect the MCP endpoint with the shared
+        // ioBroker OAuth2 login: clients present a Bearer access token (obtained from
+        // `POST /oauth/token`), an `access_token` cookie, or HTTP Basic auth (`user:password`).
+        if (this.authRequired) {
+            // The OAuth2 token endpoint (added by createOAuth2Server) needs its request body parsed.
+            // Scope the parser to that path so the MCP transport keeps its own body handling.
+            app.use('/oauth/token', express.urlencoded({ extended: false }), express.json());
+            this.oauth2 = createOAuth2Server(this.adapter, {
+                app,
+                secure: !!this.config.secure,
+                // Permit HTTP Basic auth so headless MCP clients can send `user:password` directly,
+                // in addition to obtaining a Bearer access token from `POST /oauth/token`.
+                noBasicAuth: false,
+            });
+            this.adapter.log.info(
+                'MCP authentication is enabled: requests to the MCP endpoint must present valid ioBroker credentials',
+            );
+        } else if (!this.extension && !this.config.auth) {
+            this.adapter.log.warn(
+                'MCP authentication is disabled: the MCP endpoint is reachable without credentials. ' +
+                    'Enable "Authentication" in the adapter settings when the port is exposed to untrusted networks.',
+            );
+        }
+
         // --- MCP Streamable HTTP transport ---
-        app.post(mcpPath, jsonParser, (req: Request, res: Response) => {
+        // When authentication is required, `authGuard` runs first and rejects any request that the
+        // OAuth2 `authorize` middleware could not associate with a user.
+        const guards: RequestHandler[] = this.authRequired ? [this.authGuard] : [];
+        app.post(mcpPath, ...guards, jsonParser, (req: Request, res: Response) => {
             void this.handleMcpPost(req, res);
         });
-        app.get(mcpPath, (req: Request, res: Response) => {
+        app.get(mcpPath, ...guards, (req: Request, res: Response) => {
             void this.handleMcpSessionRequest(req, res);
         });
-        app.delete(mcpPath, (req: Request, res: Response) => {
+        app.delete(mcpPath, ...guards, (req: Request, res: Response) => {
             void this.handleMcpSessionRequest(req, res);
         });
 
@@ -311,6 +362,30 @@ export default class McpServer {
             });
         }
     }
+
+    /**
+     * Guard for the MCP endpoint when authentication is enabled (standalone mode). By the time this
+     * runs, the global OAuth2 `authorize` middleware installed by {@link createOAuth2Server} has
+     * already populated `req.user` from a Bearer token, an `access_token` cookie or HTTP Basic auth
+     * — and answered with 401 itself if a *wrong* credential was supplied. A request with *no*
+     * credential, however, falls through `authorize` with `req.user` still unset, so here we reject
+     * anything that could not be tied to an authenticated ioBroker user.
+     */
+    private authGuard = (req: Request, res: Response, next: NextFunction): void => {
+        if ((req as AuthenticatedRequest).user) {
+            next();
+            return;
+        }
+        this.adapter.log.debug(`Rejected unauthenticated MCP request ${req.method} ${req.url} from ${req.ip}`);
+        if (!res.headersSent) {
+            res.set('WWW-Authenticate', 'Bearer realm="ioBroker MCP", Basic realm="ioBroker MCP"');
+            res.status(401).json({
+                jsonrpc: '2.0',
+                error: { code: -32001, message: 'Unauthorized: valid ioBroker credentials required' },
+                id: null,
+            });
+        }
+    };
 
     /**
      * Called by the ioBroker web adapter to list this extension on its welcome/intro page.
