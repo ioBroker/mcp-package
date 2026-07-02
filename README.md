@@ -157,7 +157,7 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 0.1.1 (2026-07-02)
 * (@GermanBluefox) Fixed authentication: with "Enable Authentication" on, the standalone MCP endpoint now
   requires valid ioBroker credentials (Bearer token or HTTP Basic auth) and rejects anonymous requests with
   `401 Unauthorized` (#44)
