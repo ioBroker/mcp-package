@@ -421,13 +421,33 @@ export async function controls(
                     };
                 });
 
-                // find out the room the found control is in
-                const room = rooms.find(room => room?.common?.members?.includes(id));
+                // find out the room the found control is in; if the state itself is not a member of any
+                // room, fall back to its channel or device parent (e.g. an alias state under a channel
+                // that carries the room assignment).
+                const parentChannelId = getChannelId(id, devicesObject);
+                const parentDeviceId = getDeviceId(id, devicesObject);
+                // For alias devices the state name is often generic (e.g. "SET"); prefer the name of the
+                // immediate enclosing alias channel/device (cf. ioBroker.iot getObjectName on the channel/
+                // device object). Falls back to the state's own name below.
+                const aliasParent = id.startsWith('alias.') ? devicesObject[parentOf(id)] : undefined;
+                const aliasParentName =
+                    aliasParent && (aliasParent.type === 'channel' || aliasParent.type === 'device')
+                        ? aliasParent.common?.name
+                        : undefined;
+                const room =
+                    rooms.find(r => r?.common?.members?.includes(id)) ||
+                    (parentChannelId ? rooms.find(r => r?.common?.members?.includes(parentChannelId)) : undefined) ||
+                    (parentDeviceId ? rooms.find(r => r?.common?.members?.includes(parentDeviceId)) : undefined);
 
-                // find out the functionality the found control assigned to
-                const functionality = functionalities.find(functionality =>
-                    functionality?.common?.members?.includes(id),
-                );
+                // find out the functionality the found control is assigned to (same parent fallback)
+                const functionality =
+                    functionalities.find(f => f?.common?.members?.includes(id)) ||
+                    (parentChannelId
+                        ? functionalities.find(f => f?.common?.members?.includes(parentChannelId))
+                        : undefined) ||
+                    (parentDeviceId
+                        ? functionalities.find(f => f?.common?.members?.includes(parentDeviceId))
+                        : undefined);
 
                 const smartName = getSmartNameFromObj(devicesObject[id], adapter.namespace);
                 iotControl.object = {
@@ -439,7 +459,7 @@ export async function controls(
                         type: devicesObject[id].common?.type,
                         states: devicesObject[id].common?.states,
                         role: devicesObject[id].common?.role,
-                        name: devicesObject[id].common?.name,
+                        name: aliasParentName || devicesObject[id].common?.name,
                         icon: devicesObject[id].common?.icon,
                         color: devicesObject[id].common?.color,
                         smartName,

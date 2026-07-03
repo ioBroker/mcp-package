@@ -60,7 +60,7 @@ Clients may authenticate in either of two ways:
   ```bash
   curl -X POST https://HOST:PORT/oauth/token \
     -H 'Content-Type: application/x-www-form-urlencoded' \
-    -d 'grant_type=password&username=mcpserver&password=secret'
+    -d 'grant_type=password&client_id=ioBroker&username=mcpserver&password=secret'
   # → { "access_token": "...", "token_type": "Bearer", "expires_in": 3600, "refresh_token": "..." }
   ```
 
@@ -157,6 +157,9 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Better rooms and name resolution
+
 ### 0.1.2 (2026-07-02)
 * (@GermanBluefox) Fixed authentication: with "Enable Authentication" on, the standalone MCP endpoint now
   requires valid ioBroker credentials (Bearer token or HTTP Basic auth) and rejects anonymous requests with
