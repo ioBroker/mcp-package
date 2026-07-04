@@ -174,11 +174,11 @@ async function functionalitiesAndRooms(
 }
 
 function getChannelId(id: string, objects: Record<string, ioBroker.Object>): string | null {
-    if (objects[id] && objects[id].type === 'channel') {
+    if (objects[id]?.type === 'channel') {
         return id;
     }
 
-    if (objects[id] && objects[id].type === 'state') {
+    if (objects[id]?.type === 'state') {
         const channelId = parentOf(id);
         if (objects[channelId] && objects[channelId].type === 'channel') {
             return channelId;
