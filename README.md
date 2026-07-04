@@ -157,7 +157,7 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### 0.1.3 (2026-07-03)
+### **WORK IN PROGRESS**
 * (@GermanBluefox) Better rooms and name resolution
 
 ### 0.1.2 (2026-07-02)
