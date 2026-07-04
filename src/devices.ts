@@ -274,6 +274,37 @@ export async function controls(
     // all ids, i.e. ids of all iobroker states/channels/devices
     const keys = Object.keys(devicesObject).sort();
 
+    // Also inspect every alias.0 channel/device/state, even when it is not a member of any room or
+    // function enum — otherwise alias devices assigned to no enum are never detected. Duplicate ids are
+    // harmless: the detector below dedupes via the shared `usedIds`.
+    keys.forEach(id => {
+        if (!id.startsWith('alias.0.')) {
+            return;
+        }
+        const obj = devicesObject[id];
+        const objType = obj?.type;
+        if (
+            !obj?.common ||
+            (objType !== 'state' && objType !== 'channel' && objType !== 'device') ||
+            list.includes(id) ||
+            getSmartNameFromObj(obj, adapter.namespace) === false
+        ) {
+            return;
+        }
+        // Prefer the enclosing channel/device as the detection root (same rule as the room-enum branch).
+        const channelId = getChannelId(id, devicesObject);
+        if (channelId) {
+            if (!list.includes(channelId)) {
+                const deviceId = getDeviceId(id, devicesObject);
+                if (!deviceId || !list.includes(deviceId)) {
+                    list.push(id);
+                }
+            }
+        } else {
+            list.push(id);
+        }
+    });
+
     const idsWithSmartName: string[] = [];
     // if a state has got a smart name directly assigned and neither itself nor its channel is in the list, add its id to the inspection list
     // and process it first
