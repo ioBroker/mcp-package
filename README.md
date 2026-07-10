@@ -157,6 +157,9 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Added `fillLevel`
+
 ### 0.1.5 (2026-07-04)
 * (@GermanBluefox) Better rooms and name resolution
 

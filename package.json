@@ -24,7 +24,7 @@
     "node": ">=18.14.1"
   },
   "dependencies": {
-    "@iobroker/type-detector": "^5.0.13",
+    "@iobroker/type-detector": "^5.0.15",
     "@iobroker/webserver": "^1.4.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "express": "^5.2.1",

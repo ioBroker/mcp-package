@@ -540,6 +540,7 @@ type ControlType =
     | 'open'
     | 'close'
     | 'fanSpeed'
+    | 'fillLevel'
     | 'boostMode'
     | 'swingPosition'
     | 'saturation'
@@ -781,6 +782,10 @@ function getControlType(device: IotExternalPatternControl, state: IotExternalDet
     } else if (device.type === Types.windowTilt) {
         if (state.name === 'ACTUAL') {
             smartType = 'openedClosed';
+        }
+    } else if (device.type === Types.fillLevel) {
+        if (state.name === 'ACTUAL') {
+            smartType = 'fillLevel';
         }
     }
 
