@@ -197,7 +197,7 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.0.1 (2026-08-04)
 * (@GermanBluefox) Added OAuth support: MCP clients can now connect through a browser login instead of a manually created token
 * (@GermanBluefox) OAuth also works as a web extension, using the host `web` instance as the authorization server
 * (@GermanBluefox) Access tokens are checked against the resource they were issued for (RFC 8707)
