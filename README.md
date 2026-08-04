@@ -50,7 +50,9 @@ The adapter can be configured through the ioBroker admin interface using JSONCon
   user's ACLs are enforced. A plain name like `operator` is automatically expanded to `system.user.operator`.
   When running as a web extension and no user is set here, the host `web` instance's default user is used.
 - **Enable OAuth**: Offer the browser-based OAuth2 login that MCP clients such as Claude Desktop use when
-  a connector is added. Requires *Enable Authentication* and standalone mode. See below.
+  a connector is added. In standalone mode this requires *Enable Authentication*. As a **web extension**
+  it also works, but the login is then provided by the host `web` instance, so OAuth has to be enabled
+  **there as well** (web ≥ 9.1.0, "Allow third-party clients"). See below.
 - **Public URL**: The externally reachable base URL of this server, e.g. `https://iobroker.example.com`.
   **Required behind a reverse proxy** — the URLs published in the OAuth discovery documents must be the
   ones the client can actually reach. When empty, they are derived from each incoming request.
@@ -77,7 +79,14 @@ Two requirements are easy to miss:
   internal address and the client cannot complete the flow.
 
 Access tokens issued this way are bound to this server (RFC 8707): a token minted for some other service is
-rejected with `error="invalid_token"`, even when it belongs to a valid ioBroker user.
+rejected with `error="invalid_token"`, even when it belongs to a valid ioBroker user. This matters most as a
+web extension, where other resources on the same web server are authorized by the same login.
+
+As a **web extension** the division of labour is: the host `web` instance runs the login, consent and token
+endpoints, and this adapter publishes the metadata for its own endpoint under
+`/.well-known/oauth-protected-resource/mcp` and verifies the audience. Enable OAuth in both — with it off in
+`web`, unauthenticated MCP requests are answered with a redirect to the login page, which no MCP client can
+use.
 
 Users can disconnect a client at any time; the client's tokens can be dropped via `POST /oauth/revoke`.
 
@@ -188,8 +197,9 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### 1.0.0 (2026-08-04)
+### **WORK IN PROGRESS**
 * (@GermanBluefox) Added OAuth support: MCP clients can now connect through a browser login instead of a manually created token
+* (@GermanBluefox) OAuth also works as a web extension, using the host `web` instance as the authorization server
 * (@GermanBluefox) Access tokens are checked against the resource they were issued for (RFC 8707)
 * (@GermanBluefox) Requires `@iobroker/webserver` 2.0.1
 

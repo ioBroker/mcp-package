@@ -13,7 +13,7 @@ import {
     SubscribeRequestSchema,
     UnsubscribeRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { createOAuth2Server, type OAuth2Model } from '@iobroker/webserver';
+import { createOAuth2Server, type InternalStorageToken, type OAuth2Model } from '@iobroker/webserver';
 import { getAiFriendlyStructure, type Room } from './devices';
 import { iobUriParse } from './iob-uri';
 import type { McpConfig } from './types';
@@ -145,11 +145,16 @@ export default class McpServer {
      */
     private readonly authRequired: boolean;
     /**
-     * Whether the browser-based OAuth2 authorization code flow is offered on top of Bearer/Basic
-     * auth. Requires {@link authRequired}; this is what lets MCP clients connect without the user
-     * handing them ioBroker credentials.
+     * Whether *we* run the OAuth2 authorization server (login and consent pages, token issuance).
+     * Standalone mode only — as a web extension the host `web` instance owns those endpoints.
      */
-    private readonly oauthEnabled: boolean;
+    private readonly oauthProvider: boolean;
+    /**
+     * Whether the MCP endpoint is an OAuth-protected resource: we publish its metadata (RFC 9728),
+     * point clients at the authorization server in the `401`, and reject tokens minted for something
+     * else. True in standalone mode and as a web extension alike.
+     */
+    private readonly oauthResource: boolean;
     /** OAuth2 login/token server, created only when {@link authRequired} is true. */
     private oauth2?: OAuth2Model;
 
@@ -209,14 +214,22 @@ export default class McpServer {
         // authenticates every request before it reaches our routes, and in embedded in-process mode
         // there is no HTTP layer at all (`this.app` is undefined).
         this.authRequired = !this.extension && !!this.app && !!this.config.auth;
-        // The OAuth flow needs endpoints at the origin root (`/.well-known/*`, `/oauth/*`), which we
-        // can only claim when we own the Express app.
-        this.oauthEnabled = this.authRequired && !!this.config.oauth;
-        if (this.config.oauth && !this.authRequired) {
+        // We run the authorization server ourselves only when we own the Express app — it needs
+        // `/oauth/*` and `/.well-known/oauth-authorization-server` at the origin root.
+        this.oauthProvider = this.authRequired && !!this.config.oauth;
+        // We act as an OAuth-protected resource in both HTTP modes: standalone on top of our own
+        // authorization server, and as a web extension on top of the host `web` instance's one. In
+        // both cases we publish the resource metadata for our endpoint and verify the audience.
+        this.oauthResource = !!this.app && !!this.config.oauth && (this.authRequired || this.extension);
+        if (this.config.oauth && !this.oauthResource && !!this.app) {
             this.adapter.log.warn(
-                this.extension
-                    ? 'OAuth is configured but ignored: as a web extension the host "web" adapter owns authentication'
-                    : 'OAuth is configured but ignored: it requires "Enable Authentication" in standalone mode',
+                'OAuth is configured but ignored: it requires "Enable Authentication" in standalone mode',
+            );
+        }
+        if (this.oauthResource && this.extension) {
+            this.adapter.log.info(
+                'MCP OAuth as a web extension: the host "web" instance provides the authorization server, ' +
+                    'so OAuth must be enabled there as well',
             );
         }
 
@@ -340,7 +353,7 @@ export default class McpServer {
                 // in addition to obtaining a Bearer access token from `POST /oauth/token`.
                 noBasicAuth: false,
                 // Browser-based login/consent for MCP clients that must not see the user's password.
-                authorizationCode: this.oauthEnabled,
+                authorizationCode: this.oauthProvider,
                 baseUrl: this.config.publicUrl || undefined,
                 dynamicClientRegistration: this.config.oauthDynamicRegistration !== false,
                 productName: 'ioBroker MCP',
@@ -349,39 +362,10 @@ export default class McpServer {
                 'MCP authentication is enabled: requests to the MCP endpoint must present valid ioBroker credentials',
             );
 
-            if (this.oauthEnabled) {
-                // RFC 9728: tells the client which authorization server to use for this resource.
-                // Clients derive the path from the resource path, so `/mcp` is looked up under
-                // `/.well-known/oauth-protected-resource/mcp`; the bare path is served as well
-                // because older clients ask for that one.
-                const sendResourceMetadata = (req: Request, res: Response): void => {
-                    const baseUrl = this.getBaseUrl(req);
-                    res.set('Cache-Control', 'public, max-age=300');
-                    res.json({
-                        resource: `${baseUrl}/mcp`,
-                        authorization_servers: [baseUrl],
-                        bearer_methods_supported: ['header'],
-                        resource_name: 'ioBroker MCP',
-                    });
-                };
-                app.get('/.well-known/oauth-protected-resource', sendResourceMetadata);
-                app.get('/.well-known/oauth-protected-resource/mcp', sendResourceMetadata);
-
+            if (this.oauthProvider) {
                 this.adapter.log.info(
                     'MCP OAuth is enabled: clients can connect through a browser login at /oauth/authorize',
                 );
-                if (!this.config.publicUrl) {
-                    this.adapter.log.info(
-                        'No public URL configured — OAuth discovery URLs are derived from each request. ' +
-                            'Set it when this server runs behind a reverse proxy.',
-                    );
-                }
-                if (!this.config.secure && !this.config.publicUrl?.startsWith('https://')) {
-                    this.adapter.log.warn(
-                        'MCP OAuth without HTTPS: remote MCP clients refuse plain http:// and will not be able to connect. ' +
-                            'Enable SSL or put this server behind an https reverse proxy.',
-                    );
-                }
             }
         } else if (!this.extension && !this.config.auth) {
             this.adapter.log.warn(
@@ -390,10 +374,46 @@ export default class McpServer {
             );
         }
 
+        // --- OAuth protected resource metadata (RFC 9728) ---
+        // Tells the client which authorization server guards this endpoint. Clients derive the path
+        // from the resource path, so `/mcp` is looked up under `/.well-known/oauth-protected-resource/mcp`.
+        if (this.oauthResource) {
+            const sendResourceMetadata = (req: Request, res: Response): void => {
+                const baseUrl = this.getBaseUrl(req);
+                res.set('Cache-Control', 'public, max-age=300');
+                res.json({
+                    resource: `${baseUrl}${mcpPath}`,
+                    authorization_servers: [baseUrl],
+                    bearer_methods_supported: ['header'],
+                    resource_name: 'ioBroker MCP',
+                });
+            };
+            app.get(`/.well-known/oauth-protected-resource${mcpPath}`, sendResourceMetadata);
+            if (!this.extension) {
+                // Older clients ask for the bare path. Only standalone: as an extension this document
+                // describes the whole web server, which is not ours to answer for.
+                app.get('/.well-known/oauth-protected-resource', sendResourceMetadata);
+            }
+
+            if (!this.config.publicUrl) {
+                this.adapter.log.info(
+                    'No public URL configured — OAuth discovery URLs are derived from each request. ' +
+                        'Set it when this server runs behind a reverse proxy.',
+                );
+            }
+            if (!this.extension && !this.config.secure && !this.config.publicUrl?.startsWith('https://')) {
+                this.adapter.log.warn(
+                    'MCP OAuth without HTTPS: remote MCP clients refuse plain http:// and will not be able to connect. ' +
+                        'Enable SSL or put this server behind an https reverse proxy.',
+                );
+            }
+        }
+
         // --- MCP Streamable HTTP transport ---
         // When authentication is required, `authGuard` runs first and rejects any request that the
-        // OAuth2 `authorize` middleware could not associate with a user.
-        const guards: RequestHandler[] = this.authRequired ? [this.authGuard] : [];
+        // OAuth2 `authorize` middleware could not associate with a user. As a web extension the host
+        // already did that, but we still guard the endpoint to verify the token's audience.
+        const guards: RequestHandler[] = this.authRequired || this.oauthResource ? [this.authGuard] : [];
         app.post(mcpPath, ...guards, jsonParser, (req: Request, res: Response) => {
             void this.handleMcpPost(req, res);
         });
@@ -440,7 +460,9 @@ export default class McpServer {
      * @param next Passed on when the request may proceed
      */
     private async checkAuthentication(req: Request, res: Response, next: NextFunction): Promise<void> {
-        if (!(req as AuthenticatedRequest).user) {
+        // Only reject a missing credential when authentication is ours to enforce. As a web extension
+        // the host decides that — with its authentication off, unauthenticated access is intended.
+        if (this.authRequired && !(req as AuthenticatedRequest).user) {
             this.adapter.log.debug(`Rejected unauthenticated MCP request ${req.method} ${req.url} from ${req.ip}`);
             if (!res.headersSent) {
                 res.set('WWW-Authenticate', this.buildAuthenticateHeader(req));
@@ -458,8 +480,8 @@ export default class McpServer {
         // "confused deputy"). Tokens without an audience come from the password grant or Basic auth,
         // where no third party was ever involved.
         const authorization = req.headers.authorization;
-        if (this.oauthEnabled && authorization?.startsWith('Bearer ')) {
-            const info = await this.oauth2?.getTokenInfo(authorization.substring(7));
+        if (this.oauthResource && authorization?.startsWith('Bearer ')) {
+            const info = await this.getTokenInfo(authorization.substring(7));
             if (info?.aud && !this.isOurAudience(info.aud, req)) {
                 this.adapter.log.warn(
                     `Rejected MCP request from ${req.ip}: the access token was issued for "${info.aud}", not for this server`,
@@ -483,6 +505,23 @@ export default class McpServer {
     }
 
     /**
+     * Read the stored record of an access token.
+     *
+     * Deliberately goes through the adapter's session storage rather than through an `OAuth2Model`:
+     * as a web extension we have no model of our own, but `this.adapter` *is* the host `web` adapter
+     * there, so this reads exactly the store its authorization server writes to.
+     *
+     * @param accessToken The Bearer token presented by the client
+     */
+    private getTokenInfo(accessToken: string): Promise<InternalStorageToken | null> {
+        return new Promise(resolve =>
+            this.adapter.getSession(`a:${accessToken}`, (data: unknown) =>
+                resolve((data as InternalStorageToken) || null),
+            ),
+        );
+    }
+
+    /**
      * Build the `WWW-Authenticate` challenge. With OAuth enabled it carries `resource_metadata`
      * (RFC 9728), which is how an MCP client discovers where to log in — without it, clients cannot
      * start the flow on their own.
@@ -493,7 +532,7 @@ export default class McpServer {
      */
     private buildAuthenticateHeader(req: Request, error?: string, description?: string): string {
         const params = ['realm="ioBroker MCP"'];
-        if (this.oauthEnabled) {
+        if (this.oauthResource) {
             params.push(`resource_metadata="${this.getBaseUrl(req)}/.well-known/oauth-protected-resource/mcp"`);
         }
         if (error) {
