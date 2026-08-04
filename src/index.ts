@@ -144,6 +144,12 @@ export default class McpServer {
      * mode with authentication enabled; as a web extension the host `web` adapter guards the routes.
      */
     private readonly authRequired: boolean;
+    /**
+     * Whether the browser-based OAuth2 authorization code flow is offered on top of Bearer/Basic
+     * auth. Requires {@link authRequired}; this is what lets MCP clients connect without the user
+     * handing them ioBroker credentials.
+     */
+    private readonly oauthEnabled: boolean;
     /** OAuth2 login/token server, created only when {@link authRequired} is true. */
     private oauth2?: OAuth2Model;
 
@@ -203,6 +209,16 @@ export default class McpServer {
         // authenticates every request before it reaches our routes, and in embedded in-process mode
         // there is no HTTP layer at all (`this.app` is undefined).
         this.authRequired = !this.extension && !!this.app && !!this.config.auth;
+        // The OAuth flow needs endpoints at the origin root (`/.well-known/*`, `/oauth/*`), which we
+        // can only claim when we own the Express app.
+        this.oauthEnabled = this.authRequired && !!this.config.oauth;
+        if (this.config.oauth && !this.authRequired) {
+            this.adapter.log.warn(
+                this.extension
+                    ? 'OAuth is configured but ignored: as a web extension the host "web" adapter owns authentication'
+                    : 'OAuth is configured but ignored: it requires "Enable Authentication" in standalone mode',
+            );
+        }
 
         // Receive ioBroker log messages (only forwarded once a session subscribes via requireLog).
         this.adapter.on('log', this.onLog);
@@ -323,10 +339,50 @@ export default class McpServer {
                 // Permit HTTP Basic auth so headless MCP clients can send `user:password` directly,
                 // in addition to obtaining a Bearer access token from `POST /oauth/token`.
                 noBasicAuth: false,
+                // Browser-based login/consent for MCP clients that must not see the user's password.
+                authorizationCode: this.oauthEnabled,
+                baseUrl: this.config.publicUrl || undefined,
+                dynamicClientRegistration: this.config.oauthDynamicRegistration !== false,
+                productName: 'ioBroker MCP',
             });
             this.adapter.log.info(
                 'MCP authentication is enabled: requests to the MCP endpoint must present valid ioBroker credentials',
             );
+
+            if (this.oauthEnabled) {
+                // RFC 9728: tells the client which authorization server to use for this resource.
+                // Clients derive the path from the resource path, so `/mcp` is looked up under
+                // `/.well-known/oauth-protected-resource/mcp`; the bare path is served as well
+                // because older clients ask for that one.
+                const sendResourceMetadata = (req: Request, res: Response): void => {
+                    const baseUrl = this.getBaseUrl(req);
+                    res.set('Cache-Control', 'public, max-age=300');
+                    res.json({
+                        resource: `${baseUrl}/mcp`,
+                        authorization_servers: [baseUrl],
+                        bearer_methods_supported: ['header'],
+                        resource_name: 'ioBroker MCP',
+                    });
+                };
+                app.get('/.well-known/oauth-protected-resource', sendResourceMetadata);
+                app.get('/.well-known/oauth-protected-resource/mcp', sendResourceMetadata);
+
+                this.adapter.log.info(
+                    'MCP OAuth is enabled: clients can connect through a browser login at /oauth/authorize',
+                );
+                if (!this.config.publicUrl) {
+                    this.adapter.log.info(
+                        'No public URL configured — OAuth discovery URLs are derived from each request. ' +
+                            'Set it when this server runs behind a reverse proxy.',
+                    );
+                }
+                if (!this.config.secure && !this.config.publicUrl?.startsWith('https://')) {
+                    this.adapter.log.warn(
+                        'MCP OAuth without HTTPS: remote MCP clients refuse plain http:// and will not be able to connect. ' +
+                            'Enable SSL or put this server behind an https reverse proxy.',
+                    );
+                }
+            }
         } else if (!this.extension && !this.config.auth) {
             this.adapter.log.warn(
                 'MCP authentication is disabled: the MCP endpoint is reachable without credentials. ' +
@@ -372,20 +428,117 @@ export default class McpServer {
      * anything that could not be tied to an authenticated ioBroker user.
      */
     private authGuard = (req: Request, res: Response, next: NextFunction): void => {
-        if ((req as AuthenticatedRequest).user) {
-            next();
+        void this.checkAuthentication(req, res, next);
+    };
+
+    /**
+     * The actual work behind {@link authGuard}: reject unauthenticated requests, and — when OAuth is
+     * enabled — additionally reject tokens that were issued for a different resource.
+     *
+     * @param req The incoming request
+     * @param res The response to write to
+     * @param next Passed on when the request may proceed
+     */
+    private async checkAuthentication(req: Request, res: Response, next: NextFunction): Promise<void> {
+        if (!(req as AuthenticatedRequest).user) {
+            this.adapter.log.debug(`Rejected unauthenticated MCP request ${req.method} ${req.url} from ${req.ip}`);
+            if (!res.headersSent) {
+                res.set('WWW-Authenticate', this.buildAuthenticateHeader(req));
+                res.status(401).json({
+                    jsonrpc: '2.0',
+                    error: { code: -32001, message: 'Unauthorized: valid ioBroker credentials required' },
+                    id: null,
+                });
+            }
             return;
         }
-        this.adapter.log.debug(`Rejected unauthenticated MCP request ${req.method} ${req.url} from ${req.ip}`);
-        if (!res.headersSent) {
-            res.set('WWW-Authenticate', 'Bearer realm="ioBroker MCP", Basic realm="ioBroker MCP"');
-            res.status(401).json({
-                jsonrpc: '2.0',
-                error: { code: -32001, message: 'Unauthorized: valid ioBroker credentials required' },
-                id: null,
-            });
+
+        // A token issued for some other service must not be usable here, even when it belongs to a
+        // valid ioBroker user — otherwise that service could replay it against us (RFC 8707,
+        // "confused deputy"). Tokens without an audience come from the password grant or Basic auth,
+        // where no third party was ever involved.
+        const authorization = req.headers.authorization;
+        if (this.oauthEnabled && authorization?.startsWith('Bearer ')) {
+            const info = await this.oauth2?.getTokenInfo(authorization.substring(7));
+            if (info?.aud && !this.isOurAudience(info.aud, req)) {
+                this.adapter.log.warn(
+                    `Rejected MCP request from ${req.ip}: the access token was issued for "${info.aud}", not for this server`,
+                );
+                if (!res.headersSent) {
+                    res.set(
+                        'WWW-Authenticate',
+                        this.buildAuthenticateHeader(req, 'invalid_token', 'token was issued for another resource'),
+                    );
+                    res.status(401).json({
+                        jsonrpc: '2.0',
+                        error: { code: -32001, message: 'Unauthorized: token was issued for another resource' },
+                        id: null,
+                    });
+                }
+                return;
+            }
         }
-    };
+
+        next();
+    }
+
+    /**
+     * Build the `WWW-Authenticate` challenge. With OAuth enabled it carries `resource_metadata`
+     * (RFC 9728), which is how an MCP client discovers where to log in — without it, clients cannot
+     * start the flow on their own.
+     *
+     * @param req The incoming request, used to derive the public URL
+     * @param error Optional RFC 6750 error code
+     * @param description Optional human-readable detail for the error
+     */
+    private buildAuthenticateHeader(req: Request, error?: string, description?: string): string {
+        const params = ['realm="ioBroker MCP"'];
+        if (this.oauthEnabled) {
+            params.push(`resource_metadata="${this.getBaseUrl(req)}/.well-known/oauth-protected-resource/mcp"`);
+        }
+        if (error) {
+            params.push(`error="${error}"`);
+            if (description) {
+                params.push(`error_description="${description}"`);
+            }
+        }
+        return `Bearer ${params.join(', ')}, Basic realm="ioBroker MCP"`;
+    }
+
+    /**
+     * Whether an access token's audience refers to this MCP endpoint.
+     *
+     * @param aud The `resource` the token was issued for
+     * @param req The incoming request, used to derive the public URL
+     */
+    private isOurAudience(aud: string, req: Request): boolean {
+        const normalize = (uri: string): string => {
+            try {
+                const parsed = new URL(uri);
+                return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`.toLowerCase();
+            } catch {
+                return uri.replace(/\/+$/, '').toLowerCase();
+            }
+        };
+        const baseUrl = this.getBaseUrl(req);
+        const expected = normalize(`${baseUrl}/mcp`);
+        const actual = normalize(aud);
+        // Accept the bare origin too: some clients send the server root rather than the endpoint path.
+        return actual === expected || actual === normalize(baseUrl);
+    }
+
+    /**
+     * The externally reachable base URL, without a trailing slash. Behind a reverse proxy the
+     * request-derived value is wrong, which is what the `publicUrl` setting is for.
+     *
+     * @param req The incoming request
+     */
+    private getBaseUrl(req: Request): string {
+        if (this.config.publicUrl) {
+            return this.config.publicUrl.replace(/\/+$/, '');
+        }
+        return `${req.protocol}://${req.get('host') || 'localhost'}`;
+    }
 
     /**
      * Called by the ioBroker web adapter to list this extension on its welcome/intro page.

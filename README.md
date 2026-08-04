@@ -49,9 +49,40 @@ The adapter can be configured through the ioBroker admin interface using JSONCon
   All object/state reads and writes performed by the tools are executed in the name of this user, so the
   user's ACLs are enforced. A plain name like `operator` is automatically expanded to `system.user.operator`.
   When running as a web extension and no user is set here, the host `web` instance's default user is used.
+- **Enable OAuth**: Offer the browser-based OAuth2 login that MCP clients such as Claude Desktop use when
+  a connector is added. Requires *Enable Authentication* and standalone mode. See below.
+- **Public URL**: The externally reachable base URL of this server, e.g. `https://iobroker.example.com`.
+  **Required behind a reverse proxy** — the URLs published in the OAuth discovery documents must be the
+  ones the client can actually reach. When empty, they are derived from each incoming request.
+- **Allow client self-registration**: Let MCP clients register themselves via RFC 7591 (default: **on**).
+  With this off, every client has to be registered by hand before it can connect.
 
-#### Authenticating a client (standalone, when authentication is enabled)
-Clients may authenticate in either of two ways:
+#### Connecting an MCP client via OAuth (recommended)
+
+With **Enable OAuth** on, a client only needs the MCP endpoint URL. It discovers the rest by itself, the
+user logs in and confirms in the browser, and the client never sees the ioBroker password:
+
+1. The client requests `/mcp` and gets `401` with a `WWW-Authenticate` header pointing at
+   `/.well-known/oauth-protected-resource/mcp` (RFC 9728).
+2. From there it finds the authorization server and registers itself (RFC 7591).
+3. The user's browser opens the ioBroker login and consent page, and the client redeems the resulting
+   authorization code with PKCE (RFC 7636).
+
+Two requirements are easy to miss:
+
+- **HTTPS is mandatory** for anything but `localhost`. The flow runs through the user's browser, and MCP
+  clients refuse plain `http://` for remote hosts. Enable SSL below or put the server behind an https
+  reverse proxy.
+- **Set the Public URL** when a reverse proxy is involved, otherwise the discovery documents advertise the
+  internal address and the client cannot complete the flow.
+
+Access tokens issued this way are bound to this server (RFC 8707): a token minted for some other service is
+rejected with `error="invalid_token"`, even when it belongs to a valid ioBroker user.
+
+Users can disconnect a client at any time; the client's tokens can be dropped via `POST /oauth/revoke`.
+
+#### Authenticating a client without OAuth (headless clients)
+Clients may also authenticate in either of two ways:
 
 - **HTTP Basic auth** — send an `Authorization: Basic <base64(user:password)>` header with every request
   (e.g. `curl -u mcpserver:secret ...`). Simplest for headless/script clients.
@@ -157,6 +188,11 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Added OAuth support: MCP clients can now connect through a browser login instead of a manually created token
+* (@GermanBluefox) Access tokens are checked against the resource they were issued for (RFC 8707)
+* (@GermanBluefox) Requires `@iobroker/webserver` 2.0.1
+
 ### 0.1.6 (2026-07-10)
 * (@GermanBluefox) Added `fillLevel`
 
