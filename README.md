@@ -144,7 +144,7 @@ state (tracked via the `Mcp-Session-Id` header). Point your MCP client at:
 | `list_rooms`                | List rooms (`enum.rooms.*`) with localized names and member details; optional `language` and `withIcons`                                                                                                                                             |
 | `list_functions`            | List functions (`enum.functions.*`) with localized names and member details; optional `language` and `withIcons`                                                                                                                                     |
 | `history_query`             | Query historical values (requires a history adapter); aggregations: `raw`, `min`, `max`, `avg`, `sum`, `count`, `minmax`, `percentile`, `quantile`, `integral`                                                                                       |
-| `read_file`                 | Read a file from an adapter file storage (optional base64)                                                                                                                                                                                           |
+| `read_file`                 | Read a file from an adapter file storage (optional base64); large files are read in chunks via `offset`/`length` (default 512 KiB per call) — the result carries `size`, `truncated` and `nextOffset`                                                 |
 | `list_files`                | List a directory in an adapter file storage                                                                                                                                                                                                          |
 | `file_exists`               | Check whether a file exists in an adapter file storage                                                                                                                                                                                               |
 | `get_logs`                  | Retrieve recent ioBroker log lines; optional filters by `level` (error/warn/info/debug), source `adapter` and start time (`from_ts`)                                                                                                                 |
@@ -197,6 +197,9 @@ tools rather than as subscribable resources.)
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) `read_file` reads large files in chunks: new optional `offset`/`length` parameters, at most 512 KiB per call by default; the result now contains `size`, `offset`, `length`, `truncated` and `nextOffset` (MCP clients reject tool results above 1 MB, ioBroker/ioBroker.mcp#63)
+
 ### 1.0.2 (2026-09-03)
 * (@GermanBluefox) Updated packages
 

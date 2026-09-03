@@ -121,6 +121,12 @@ interface SessionContext {
 const LOG_URI_PREFIX = 'ioblog://';
 /** How many recent log lines to keep for `ioblog://` resource reads. */
 const LOG_BUFFER_SIZE = 200;
+/**
+ * Default maximum number of file bytes a single `read_file` call returns.
+ * MCP clients (e.g. Claude.ai / Claude Desktop) reject tool results above 1 MiB; the content is embedded in a
+ * JSON string (escaping) or base64 (+33%), so 512 KiB of raw data keeps the wrapped result safely below that cap.
+ */
+const DEFAULT_MAX_READ_BYTES = 512 * 1024;
 
 export default class McpServer {
     private readonly adapter: ioBroker.Adapter;
@@ -1134,15 +1140,32 @@ export default class McpServer {
         server.registerTool(
             'read_file',
             {
-                description: 'Read a file from an adapter file storage, e.g. "vis-2.0/main/vis-views.json"',
+                description:
+                    'Read a file from an adapter file storage, e.g. "vis-2.0/main/vis-views.json". ' +
+                    `At most \`length\` bytes (default ${DEFAULT_MAX_READ_BYTES}) are returned per call; ` +
+                    'large files are read in chunks: when the result has `truncated: true`, call again with ' +
+                    '`offset` set to the returned `nextOffset` until `truncated` is false. ' +
+                    '`size` is the total file size in bytes.',
                 inputSchema: {
                     path: z.string().describe('Path as "<adapter>/<dir>/<file>"'),
                     base64: z.boolean().optional().describe('Return binary content base64-encoded'),
+                    offset: z
+                        .number()
+                        .int()
+                        .min(0)
+                        .optional()
+                        .describe('Byte offset to start reading from (default 0)'),
+                    length: z
+                        .number()
+                        .int()
+                        .min(1)
+                        .optional()
+                        .describe(`Maximum number of bytes to return (default ${DEFAULT_MAX_READ_BYTES})`),
                 },
             },
-            async ({ path, base64 }) => {
+            async ({ path, base64, offset, length }) => {
                 try {
-                    return ok({ ok: true, data: await this.readFile(path, base64) });
+                    return ok({ ok: true, data: await this.readFile(path, base64, offset, length) });
                 } catch (e) {
                     return fail(e);
                 }
@@ -2233,24 +2256,79 @@ export default class McpServer {
         return value as ioBroker.StateValue;
     }
 
-    /** Read a file from an adapter file storage. */
+    /**
+     * Read a (window of a) file from an adapter file storage.
+     *
+     * At most `length` bytes starting at byte `offset` are returned, so files of any size can be fetched in chunks
+     * without exceeding the tool-result size limit of MCP clients. For UTF-8 text the window edges are moved to
+     * character boundaries, so a multibyte character is never split; `nextOffset` always points at the first byte
+     * that was not returned and can be passed as `offset` of the next call.
+     */
     private async readFile(
         path: string,
         base64?: boolean,
-    ): Promise<{ path: string; mimeType?: string; encoding: 'utf8' | 'base64'; content: string }> {
+        offset = 0,
+        length = DEFAULT_MAX_READ_BYTES,
+    ): Promise<{
+        path: string;
+        mimeType?: string;
+        encoding: 'utf8' | 'base64';
+        content: string;
+        /** Total file size in bytes */
+        size: number;
+        /** Byte offset of the first returned byte */
+        offset: number;
+        /** Number of file bytes contained in `content` (before base64 encoding) */
+        length: number;
+        /** `true` when the file has more bytes after this chunk */
+        truncated: boolean;
+        /** Offset for the next call to continue reading; only present when `truncated` */
+        nextOffset?: number;
+    }> {
         const { adapterName, fileName } = McpServer.parseFilePath(path);
         const data = await this.adapter.readFileAsync(adapterName, fileName, { user: this.defaultUser });
-        const file = (data as { file: string | Buffer })?.file;
+        const file = (data as { file?: string | Buffer })?.file;
         const mimeType = (data as { mimeType?: string })?.mimeType;
-        if (base64 || typeof file !== 'string') {
-            return {
-                path,
-                mimeType,
-                encoding: 'base64',
-                content: Buffer.from(file).toString('base64'),
-            };
+        if (file === undefined || file === null) {
+            throw new Error(`File "${path}" not found`);
         }
-        return { path, mimeType, encoding: 'utf8', content: file };
+        const asText = !base64 && typeof file === 'string';
+        const buffer = Buffer.isBuffer(file) ? file : Buffer.from(file);
+        const size = buffer.length;
+
+        let start = Math.min(Math.max(0, Math.floor(offset)), size);
+        let end = Math.min(start + Math.max(1, Math.floor(length)), size);
+        if (asText) {
+            // Never split a multibyte UTF-8 sequence: continuation bytes are 0b10xxxxxx.
+            const isContinuation = (i: number): boolean => (buffer[i] & 0xc0) === 0x80;
+            while (start < end && isContinuation(start)) {
+                start++;
+            }
+            while (end > start && end < size && isContinuation(end)) {
+                end--;
+            }
+            if (end === start && start < size) {
+                // `length` is smaller than one character: return at least that whole character to guarantee progress.
+                end = start + 1;
+                while (end < size && isContinuation(end)) {
+                    end++;
+                }
+            }
+        }
+
+        const chunk = buffer.subarray(start, end);
+        const truncated = end < size;
+        return {
+            path,
+            mimeType,
+            encoding: asText ? 'utf8' : 'base64',
+            content: chunk.toString(asText ? 'utf8' : 'base64'),
+            size,
+            offset: start,
+            length: chunk.length,
+            truncated,
+            ...(truncated ? { nextOffset: end } : {}),
+        };
     }
 
     /** Write a file to an adapter file storage. */
