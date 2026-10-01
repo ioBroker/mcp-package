@@ -26,7 +26,7 @@
   "dependencies": {
     "@iobroker/type-detector": "^6.0.1",
     "@iobroker/webserver": "^3.0.2",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.30.1",
     "express": "^5.2.1",
     "zod": "^4.6.2"
   },
