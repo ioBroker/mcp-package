@@ -549,11 +549,7 @@ export default class McpServer {
      * @param accessToken The Bearer token presented by the client
      */
     private getTokenInfo(accessToken: string): Promise<ioBroker.Session | null> {
-        return new Promise(resolve =>
-            this.adapter.getSession(`a:${accessToken}`, data =>
-                resolve(data || null),
-            ),
-        );
+        return new Promise(resolve => this.adapter.getSession(`a:${accessToken}`, data => resolve(data || null)));
     }
 
     /**

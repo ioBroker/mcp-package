@@ -226,7 +226,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### 1.2.2 (2026-10-19)
+### **WORK IN PROGRESS**
 * (@GermanBluefox) updated packages
 
 ### 1.2.0 (2026-10-19)
