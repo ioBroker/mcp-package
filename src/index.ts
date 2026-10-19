@@ -904,7 +904,9 @@ export default class McpServer {
                     },
                     description:
                         'Set multiple states in one call (e.g. for scenes or group actions like "all lights off"). ' +
-                        'Each value is coerced to its state type. Failures of single states do not abort the rest.',
+                        'Each value is coerced to its state type. The call is rejected as a whole and nothing is ' +
+                        'written if any of the states may not be written by the configured ioBroker user; other ' +
+                        'failures of single states are reported per item and do not abort the rest.',
                     inputSchema: {
                         states: z
                             .array(
@@ -1745,10 +1747,15 @@ export default class McpServer {
         return states;
     }
 
-    /** Write multiple states; failures of single states are reported per item and do not abort the rest. */
+    /**
+     * Write multiple states as one operation: the write permission of every state is verified first, so a
+     * batch containing a single state the default user may not write fails as a whole and nothing is
+     * written. Other failures of single states are reported per item and do not abort the rest.
+     */
     private async setStates(
         items: { id: string; value: unknown; ack?: boolean }[],
     ): Promise<Record<string, unknown>[]> {
+        await this.assertStatesWritable(items.map(item => item.id));
         const results: Record<string, unknown>[] = [];
         for (const item of items) {
             try {
@@ -1759,6 +1766,74 @@ export default class McpServer {
             }
         }
         return results;
+    }
+
+    /**
+     * Verify that the default user may write every given state, mirroring the checks js-controller runs in
+     * `setForeignState`: the user must be able to read the object (needed for the type coercion in
+     * {@link setState}) and the state ACL must allow writing — for an alias also on its write target.
+     *
+     * @param ids state IDs to check
+     * @throws {Error} when at least one state may not be written; the message lists all of them
+     */
+    private async assertStatesWritable(ids: string[]): Promise<void> {
+        if (this.defaultUser === 'system.user.admin') {
+            return;
+        }
+        const permissions = await this.adapter.calculatePermissionsAsync(this.defaultUser, []);
+        if (permissions.groups?.includes('system.group.administrator')) {
+            return;
+        }
+        const denied: string[] = [];
+        for (const id of new Set(ids)) {
+            let obj: ioBroker.Object | null | undefined;
+            try {
+                obj = await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser });
+            } catch {
+                denied.push(id);
+                continue;
+            }
+            let writable = this.isStateWritable(obj, permissions);
+            const alias = (obj?.common as { alias?: { id?: string | { read?: string; write?: string } } } | undefined)
+                ?.alias;
+            const targetId = typeof alias?.id === 'object' ? alias.id.write : alias?.id;
+            if (writable && id.startsWith('alias.') && targetId) {
+                // js-controller checks the target with the rights of the adapter itself, not the object read
+                writable = this.isStateWritable(await this.adapter.getForeignObjectAsync(targetId), permissions);
+            }
+            if (!writable) {
+                denied.push(id);
+            }
+        }
+        if (denied.length) {
+            throw new Error(
+                `permissionError: user "${this.defaultUser}" may not write ${denied.join(', ')} - nothing was written`,
+            );
+        }
+    }
+
+    /**
+     * The state ACL check of js-controller for `setState` on a single object.
+     *
+     * @param obj the state object (objects without ACL are not restricted by js-controller)
+     * @param permissions the merged group permissions of the default user
+     */
+    private isStateWritable(obj: ioBroker.Object | null | undefined, permissions: ioBroker.PermissionSet): boolean {
+        const acl = obj?.acl as Partial<ioBroker.StateACL> | undefined;
+        const stateAcl = acl?.state || acl?.object;
+        if (!acl || !stateAcl) {
+            return true;
+        }
+        if (!permissions.state?.write) {
+            return false;
+        }
+        let mask = 0x002; // everyone write
+        if (acl.owner === this.defaultUser) {
+            mask = 0x200; // owner write
+        } else if (acl.ownerGroup && permissions.groups?.includes(acl.ownerGroup)) {
+            mask = 0x020; // group write
+        }
+        return !!(stateAcl & mask);
     }
 
     /**

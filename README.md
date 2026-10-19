@@ -110,7 +110,8 @@ the ACLs the MCP client should have.
 
 ### Permissions
 - **Allow setting states**: Allow MCP clients to write state values (the `set_state` and `set_states` tools).
-  Default: **on**.
+  Default: **on**. Which states can be written is decided by the ACLs of the Default User. `set_states` checks the
+  write permission of all states first and writes nothing if one of them is not writable.
 - **Mark setting states as destructive** (`setStateDestructive`): Declare `set_state` and `set_states` with
   `destructiveHint: true`, so MCP clients can warn before a state is written. Default: **on**. When off, both tools
   are declared as non-destructive writes (`readOnlyHint` stays `false`); whether a client still asks for
@@ -225,6 +226,10 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@Garfonso) Fixed: with "Allow object/file changes" enabled, MCP clients received no tools at all when the MCP SDK uses a different zod copy; omitted tool arguments with a default are no longer rejected (ioBroker/ioBroker.mcp#70)
+* (@GermanBluefox) `set_states` checks the write permission of all states before writing and rejects the whole call if one of them may not be written by the Default User (ioBroker/ioBroker.mcp#71)
+
 ### 1.1.3 (2026-09-15)
 * (@GermanBluefox) Requests with an unknown `Mcp-Session-Id` (e.g. after a restart) are answered with `404 Not Found` instead of `400`, so MCP clients start a new session as required by the Streamable HTTP specification
 
