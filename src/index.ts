@@ -1,11 +1,15 @@
-import express, { type Express, type Request, type RequestHandler, type Response, type NextFunction } from 'express';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import net from 'node:net';
 import dns from 'node:dns';
 import fs from 'node:fs';
+import type { Server as HttpServer } from 'node:http';
+import type { Server as HttpsServer } from 'node:https';
 import { execFile } from 'node:child_process';
 import { z } from 'zod';
+import express, { type Express, type Request, type RequestHandler, type Response, type NextFunction } from 'express';
+
+import { createOAuth2Server, type OAuth2Model } from '@iobroker/webserver';
 import { McpServer as McpSdkServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
@@ -13,12 +17,9 @@ import {
     SubscribeRequestSchema,
     UnsubscribeRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { createOAuth2Server, type InternalStorageToken, type OAuth2Model } from '@iobroker/webserver';
 import { getAiFriendlyStructure, type Room } from './devices';
 import { iobUriParse } from './iob-uri';
 import type { McpConfig } from './types';
-import type { Server as HttpServer } from 'node:http';
-import type { Server as HttpsServer } from 'node:https';
 import { createInProcessMcp } from './inProcessClient';
 import packageJson from '../package.json';
 
@@ -547,10 +548,10 @@ export default class McpServer {
      *
      * @param accessToken The Bearer token presented by the client
      */
-    private getTokenInfo(accessToken: string): Promise<InternalStorageToken | null> {
+    private getTokenInfo(accessToken: string): Promise<ioBroker.Session | null> {
         return new Promise(resolve =>
-            this.adapter.getSession(`a:${accessToken}`, (data: unknown) =>
-                resolve((data as InternalStorageToken) || null),
+            this.adapter.getSession(`a:${accessToken}`, data =>
+                resolve(data || null),
             ),
         );
     }
