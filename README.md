@@ -226,6 +226,9 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) updated packages
+
 ### 1.2.0 (2026-10-19)
 * (@Garfonso) Fixed: with "Allow object/file changes" enabled, MCP clients received no tools at all when the MCP SDK uses a different zod copy; omitted tool arguments with a default are no longer rejected (ioBroker/ioBroker.mcp#70)
 * (@GermanBluefox) `set_states` checks the write permission of all states before writing and rejects the whole call if one of them may not be written by the Default User (ioBroker/ioBroker.mcp#71)
