@@ -218,4 +218,54 @@ describe('tool metadata', () => {
             await limited.close();
         }
     });
+    /**
+     * Both assertions below guard against a split zod installation. The MCP SDK converts and
+     * re-wraps the registered schemas with the zod copy from its own dependency tree, which is
+     * not necessarily the copy this package built them with. Two constructs do not survive that:
+     *
+     *   z.record(...)            -> its JSON Schema processor pushes onto a context field that
+     *                               only newer zod versions create, so tools/list throws
+     *                               "Cannot read properties of undefined (reading 'push')" and
+     *                               the client ends up without any tool at all.
+     *   top-level z.default(...) -> the SDK's object parser does not recognise a foreign
+     *                               ZodDefault, treats the key as required and answers a call
+     *                               that omits it with "expected nonoptional".
+     *
+     * Neither is visible in a deduplicated dev install, hence these contract tests on the
+     * advertised schema: `propertyNames` is what a record emits, `default` what z.default() emits.
+     */
+    it('advertises no record-derived schema, which breaks across zod versions', () => {
+        for (const tool of tools) {
+            const found = [];
+            const walk = (node, path) => {
+                if (!node || typeof node !== 'object') {
+                    return;
+                }
+                if (Object.prototype.hasOwnProperty.call(node, 'propertyNames')) {
+                    found.push(path || '<root>');
+                }
+                for (const [key, value] of Object.entries(node)) {
+                    walk(value, path ? `${path}.${key}` : key);
+                }
+            };
+            walk(tool.inputSchema, '');
+            assert.deepEqual(
+                found,
+                [],
+                `${tool.name}: use z.looseObject({}) instead of z.record() at ${found.join(', ')}`,
+            );
+        }
+    });
+
+    it('advertises no default on a top-level argument, which breaks across zod versions', () => {
+        for (const tool of tools) {
+            const properties = tool.inputSchema.properties || {};
+            for (const [name, schema] of Object.entries(properties)) {
+                assert.ok(
+                    !Object.prototype.hasOwnProperty.call(schema, 'default'),
+                    `${tool.name}.${name}: make it .optional() and apply the default in the handler`,
+                );
+            }
+        }
+    });
 });

@@ -873,6 +873,11 @@ export default class McpServer {
                         id: z.string().describe('State ID'),
                         value: z.any().describe('New value (type depends on the state)'),
                         options: z
+                            // `.default()` is fine here because it sits inside a nested z.object():
+                            // only the top-level fields of an inputSchema are re-wrapped by the SDK
+                            // with its own zod copy, which does not recognise a foreign ZodDefault and
+                            // then rejects the call with "expected nonoptional". See the top-level
+                            // fields of the other tools, which pass their defaults in code instead.
                             .object({ ack: z.boolean().default(false), expire: z.number().int().nullable().optional() })
                             .optional(),
                     },
@@ -935,7 +940,7 @@ export default class McpServer {
                 inputSchema: {
                     level: z.array(z.enum(['error', 'warn', 'info', 'debug'])).optional(),
                     from_ts: z.number().int().optional(),
-                    limit: z.number().int().default(200),
+                    limit: z.number().int().optional().describe('Maximum number of lines to return (default 200)'),
                     adapter: z.string().optional(),
                 },
             },
@@ -965,8 +970,8 @@ export default class McpServer {
                 inputSchema: {
                     host: z.string(),
                     port: z.number().int().min(1).max(65535).optional(),
-                    count: z.number().int().min(1).max(10).default(2),
-                    timeout: z.number().int().min(100).max(20000).default(2000),
+                    count: z.number().int().min(1).max(10).optional().describe('ICMP echo requests (default 2)'),
+                    timeout: z.number().int().min(100).max(20000).optional().describe('Timeout in ms (default 2000)'),
                 },
             },
             async args => {
@@ -1012,7 +1017,7 @@ export default class McpServer {
                     role: z.string().optional(),
                     room: z.string().optional(),
                     adapter: z.string().optional().describe('Filter by source adapter instance, e.g. "hue.0"'),
-                    limit: z.number().int().default(50),
+                    limit: z.number().int().optional().describe('Maximum number of results (default 50)'),
                 },
             },
             async args => {
@@ -1072,7 +1077,8 @@ export default class McpServer {
                             'quantile',
                             'integral',
                         ])
-                        .default('raw'),
+                        .optional()
+                        .describe('Aggregation method (default "raw")'),
                     percentile: z
                         .number()
                         .min(0)
@@ -1086,7 +1092,7 @@ export default class McpServer {
                         .optional()
                         .describe('Quantile (0-1), only used with agg=quantile'),
                     interval: z.string().optional().describe('Aggregation interval, e.g. 15m, 1h'),
-                    limit: z.number().int().default(1000),
+                    limit: z.number().int().optional().describe('Maximum number of values (default 1000)'),
                 },
             },
             async args => {
@@ -1177,7 +1183,7 @@ export default class McpServer {
                         .optional()
                         .describe('If true, return only adapters that are not installed yet'),
                     language: z.enum(LANGUAGES).optional().describe('Language for title/description'),
-                    limit: z.number().int().default(20),
+                    limit: z.number().int().optional().describe('Maximum number of results (default 20)'),
                 },
             },
             async args => {
@@ -1345,13 +1351,14 @@ export default class McpServer {
                 description: 'Write a message to the ioBroker log',
                 inputSchema: {
                     message: z.string(),
-                    level: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
+                    level: z.enum(['error', 'warn', 'info', 'debug']).optional().describe('Log level (default "info")'),
                 },
             },
             ({ message, level }): Promise<ToolResult> => {
                 try {
-                    this.adapter.log[level](message);
-                    return Promise.resolve(ok({ ok: true, data: { message, level } }));
+                    const logLevel = level || 'info';
+                    this.adapter.log[logLevel](message);
+                    return Promise.resolve(ok({ ok: true, data: { message, level: logLevel } }));
                 } catch (e) {
                     return Promise.resolve(fail(e));
                 }
@@ -1375,14 +1382,21 @@ export default class McpServer {
                         'provided common/native; a missing one is created from the provided object.',
                     inputSchema: {
                         id: z.string().describe('Object ID'),
+                        // Deliberately `looseObject` and not `record`: the MCP SDK converts the tool
+                        // schemas with the zod copy of its own dependency tree, which is not
+                        // necessarily the one these schemas were built with. `record`'s JSON Schema
+                        // processor relies on a context field that only newer zod versions create,
+                        // so a split zod installation makes `tools/list` throw -32603 and the client
+                        // ends up with no tools at all. `looseObject` produces the same
+                        // `additionalProperties` schema and works across versions.
                         obj: z
-                            .record(z.string(), z.any())
+                            .looseObject({})
                             .describe('Partial object, e.g. { "type": "state", "common": {...}, "native": {...} }'),
                     },
                 },
                 async ({ id, obj }) => {
                     try {
-                        const result = await this.setObject(id, obj as Partial<ioBroker.Object>);
+                        const result = await this.setObject(id, obj);
                         return ok({ ok: true, data: result });
                     } catch (e) {
                         return fail(e);
@@ -1436,11 +1450,14 @@ export default class McpServer {
                         name: z.string().optional().describe('Display name (defaults to the last ID segment)'),
                         type: z
                             .enum(['boolean', 'number', 'string', 'array', 'object', 'mixed'])
-                            .default('mixed')
-                            .describe('Value type of the state'),
-                        role: z.string().default('state').describe('Role, e.g. switch.light, value.temperature'),
-                        read: z.boolean().default(true),
-                        write: z.boolean().default(true),
+                            .optional()
+                            .describe('Value type of the state (default "mixed")'),
+                        role: z
+                            .string()
+                            .optional()
+                            .describe('Role, e.g. switch.light, value.temperature (default "state")'),
+                        read: z.boolean().optional().describe('Readable (default true)'),
+                        write: z.boolean().optional().describe('Writable (default true)'),
                         unit: z.string().optional(),
                         min: z.number().optional(),
                         max: z.number().optional(),
@@ -2082,7 +2099,7 @@ export default class McpServer {
         adapter?: string;
         limit?: number;
     }): Promise<Record<string, unknown>[]> {
-        const { query = '', type, role, room, adapter, limit = 100 } = params;
+        const { query = '', type, role, room, adapter, limit = 50 } = params;
         const result = await this.adapter.getObjectListAsync(
             {
                 startkey: '',
