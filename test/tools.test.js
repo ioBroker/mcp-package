@@ -477,6 +477,120 @@ describe('writing tools', () => {
     });
 });
 
+describe('set_states permissions', () => {
+    const user = 'system.user.mcp';
+    let ctx;
+
+    /**
+     * Give a state an ACL: readable by everyone, writable only by the owner group.
+     *
+     * @param id state ID
+     * @param ownerGroup the group that may write the state
+     */
+    function protect(id, ownerGroup) {
+        ctx.objects[id].acl = { owner: 'system.user.admin', ownerGroup, object: 0x664, state: 0x664 };
+    }
+
+    beforeEach(async () => {
+        ctx = await startMcp({ defaultUser: user });
+        ctx.permissions[user] = {
+            user,
+            groups: ['system.group.mcp'],
+            object: { read: true, list: true },
+            state: { read: true, list: true, write: true },
+        };
+        protect('hue.0.light.state', 'system.group.mcp');
+        protect('hue.0.light.brightness', 'system.group.administrator');
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('writes when every state is writable', async () => {
+        protect('hue.0.light.brightness', 'system.group.mcp');
+        const data = await callOk(ctx.mcp, 'set_states', {
+            states: [
+                { id: 'hue.0.light.state', value: true },
+                { id: 'hue.0.light.brightness', value: 10 },
+            ],
+        });
+        assert.deepEqual(
+            data.results.map(result => result.value),
+            [true, 10],
+        );
+        assert.equal(ctx.states['hue.0.light.brightness'].val, 10);
+    });
+
+    it('rejects the whole batch if one state is not writable', async () => {
+        const result = await call(ctx.mcp, 'set_states', {
+            states: [
+                { id: 'hue.0.light.state', value: true },
+                { id: 'hue.0.light.brightness', value: 10 },
+            ],
+        });
+        assert.equal(result.isError, true);
+        assert.match(result.json.error, /permissionError/);
+        assert.match(result.json.error, /hue\.0\.light\.brightness/);
+        assert.doesNotMatch(result.json.error, /hue\.0\.light\.state\b/);
+        assert.equal(ctx.states['hue.0.light.state'].val, false, 'the allowed state was written anyway');
+        assert.equal(ctx.states['hue.0.light.brightness'].val, 42);
+    });
+
+    it('rejects the batch if the user has no state write permission at all', async () => {
+        ctx.permissions[user].state.write = false;
+        const result = await call(ctx.mcp, 'set_states', { states: [{ id: 'hue.0.light.state', value: true }] });
+        assert.equal(result.isError, true);
+        assert.equal(ctx.states['hue.0.light.state'].val, false);
+    });
+
+    it('rejects the batch if the user may not read a state object', async () => {
+        ctx.objects['hue.0.light.brightness'].acl.object = 0x660;
+        const result = await call(ctx.mcp, 'set_states', {
+            states: [
+                { id: 'hue.0.light.state', value: true },
+                { id: 'hue.0.light.brightness', value: 10 },
+            ],
+        });
+        assert.equal(result.isError, true);
+        assert.match(result.json.error, /hue\.0\.light\.brightness/);
+        assert.equal(ctx.states['hue.0.light.state'].val, false);
+    });
+
+    it('checks the write target of an alias as well', async () => {
+        ctx.objects['alias.0.lamp.level'] = {
+            _id: 'alias.0.lamp.level',
+            type: 'state',
+            common: { name: 'Lamp level', type: 'number', role: 'level', alias: { id: 'hue.0.light.brightness' } },
+            native: {},
+        };
+        protect('alias.0.lamp.level', 'system.group.mcp');
+        const denied = await call(ctx.mcp, 'set_states', { states: [{ id: 'alias.0.lamp.level', value: 10 }] });
+        assert.equal(denied.isError, true);
+        assert.match(denied.json.error, /alias\.0\.lamp\.level/);
+
+        protect('hue.0.light.brightness', 'system.group.mcp');
+        await callOk(ctx.mcp, 'set_states', { states: [{ id: 'alias.0.lamp.level', value: 10 }] });
+    });
+
+    it('does not restrict states without ACL', async () => {
+        delete ctx.objects['hue.0.light.brightness'].acl;
+        await callOk(ctx.mcp, 'set_states', {
+            states: [
+                { id: 'hue.0.light.state', value: true },
+                { id: 'hue.0.light.brightness', value: 10 },
+            ],
+        });
+        assert.equal(ctx.states['hue.0.light.brightness'].val, 10);
+    });
+
+    it('skips the check for members of the administrator group', async () => {
+        ctx.permissions[user].groups.push('system.group.administrator');
+        await callOk(ctx.mcp, 'set_states', { states: [{ id: 'hue.0.light.brightness', value: 10 }] });
+        assert.equal(ctx.states['hue.0.light.brightness'].val, 10);
+    });
+});
+
 describe('ping_host', () => {
     let ctx;
     let server;

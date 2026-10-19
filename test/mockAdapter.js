@@ -172,6 +172,23 @@ function createMockAdapter() {
     ];
     const listeners = {};
     const subscriptions = { states: [], objects: [], log: [] };
+    /** Merged group permissions per user, as returned by `calculatePermissionsAsync`. */
+    const permissions = {};
+
+    /** Object read check of js-controller for a non-admin user (only the ACL bits, no group rights). */
+    const canReadObject = (obj, user) => {
+        if (!obj || !obj.acl || user === 'system.user.admin') {
+            return true;
+        }
+        const groups = (permissions[user] && permissions[user].groups) || [];
+        if (obj.acl.owner === user) {
+            return !!(obj.acl.object & 0x400);
+        }
+        if (groups.includes(obj.acl.ownerGroup)) {
+            return !!(obj.acl.object & 0x040);
+        }
+        return !!(obj.acl.object & 0x004);
+    };
 
     const log = {
         error: message => logged.push({ level: 'error', message }),
@@ -215,7 +232,10 @@ function createMockAdapter() {
         },
 
         // --- objects --------------------------------------------------------
-        getForeignObjectAsync(id) {
+        getForeignObjectAsync(id, options) {
+            if (options && options.user && !canReadObject(objects[id], options.user)) {
+                return Promise.reject(new Error('permissionError'));
+            }
             return Promise.resolve(objects[id] ? JSON.parse(JSON.stringify(objects[id])) : null);
         },
         getForeignObjectsAsync(pattern, type) {
@@ -369,9 +389,14 @@ function createMockAdapter() {
         getSession() {
             return Promise.resolve(null);
         },
+
+        // --- users ----------------------------------------------------------
+        calculatePermissionsAsync(user) {
+            return Promise.resolve(JSON.parse(JSON.stringify(permissions[user] || { user, groups: [] })));
+        },
     };
 
-    return { adapter, objects, states, files, logged, subscriptions };
+    return { adapter, objects, states, files, logged, subscriptions, permissions };
 }
 
 module.exports = { createMockAdapter, patternToRegExp };
