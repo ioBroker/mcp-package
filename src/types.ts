@@ -23,17 +23,33 @@ export interface McpConfig {
      */
     oauthDynamicRegistration?: boolean;
     secure: boolean;
-    /** Allow the `set_state`/`set_states` tools to write states (default: true). */
+    /** Allow the `set_state`/`set_states`/`clear_notifications` tools to write states (default: true). */
     allowSetState: boolean;
     /** Declare `set_state`/`set_states` as destructive (`destructiveHint`), so clients can warn before writing (default: true). */
     setStateDestructive?: boolean;
-    /** Allow the object/file changing tools (`set_object`, `delete_object`, `create_state`, `create_scene`, `write_file`, `delete_file`, `rename_file`, `mkdir`) (default: false). */
+    /** Allow the object/file changing tools (`set_object`, `delete_object`, `create_state`, `create_scene`, `create_alias`, `write_file`, `delete_file`, `rename_file`, `mkdir`) (default: false). */
     allowObjectChange: boolean;
+    /** Allow starting, stopping and restarting instances and changing their log level (default: false). */
+    allowInstanceControl?: boolean;
+    /** Allow adding and deleting instances and upgrading adapters from the repository (default: false). */
+    allowAdapterManagement?: boolean;
     /**
      * Allow the `install_package` tool, which installs an adapter package (npm, GitHub, URL or `.tgz`)
      * on an ioBroker host (default: false). Only relevant for adapter developers.
      */
     allowPackageInstall?: boolean;
+    /** Allow creating, changing, deleting and running scripts of the javascript adapter (default: false). */
+    allowScriptChange?: boolean;
+    /**
+     * Adapters (`telegram`) or instances (`telegram.0`) the `send_to` tool may send messages to, separated by
+     * commas; `*` allows all. Empty (default): no `send_to` tool.
+     */
+    sendToAllowlist?: string;
+    /**
+     * Ask the user in the MCP client for a confirmation before dangerous actions, if the client supports
+     * elicitation (default: true).
+     */
+    confirmDangerous?: boolean;
     certPublic: string;
     certPrivate: string;
     certChained: string;
@@ -41,3 +57,30 @@ export interface McpConfig {
     certificates?: ioBroker.Certificates;
     leConfig?: boolean;
 }
+
+/** The permission toggles, which embedders (e.g. ioBroker.admin) can set without an mcp instance config. */
+export type McpPermissions = Pick<
+    McpConfig,
+    | 'allowSetState'
+    | 'setStateDestructive'
+    | 'allowObjectChange'
+    | 'allowInstanceControl'
+    | 'allowAdapterManagement'
+    | 'allowPackageInstall'
+    | 'allowScriptChange'
+    | 'sendToAllowlist'
+    | 'confirmDangerous'
+>;
+
+/** All keys of {@link McpPermissions}. */
+export const PERMISSION_KEYS: (keyof McpPermissions)[] = [
+    'allowSetState',
+    'setStateDestructive',
+    'allowObjectChange',
+    'allowInstanceControl',
+    'allowAdapterManagement',
+    'allowPackageInstall',
+    'allowScriptChange',
+    'sendToAllowlist',
+    'confirmDangerous',
+];

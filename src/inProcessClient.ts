@@ -73,11 +73,21 @@ export interface InProcessMcpOptions {
     setStateDestructive?: boolean;
     /** Allow the object/file-changing tools (`create_state`, `set_object`, ...) (default: false). */
     allowObjectChange?: boolean;
+    /** Allow starting/stopping/restarting instances and changing their log level (default: false). */
+    allowInstanceControl?: boolean;
+    /** Allow adding/deleting instances and upgrading adapters from the repository (default: false). */
+    allowAdapterManagement?: boolean;
     /**
      * Allow the `install_package` tool, which installs adapter packages on a host (default: false).
      * Only relevant for adapter developers.
      */
     allowPackageInstall?: boolean;
+    /** Allow creating/changing/deleting/running scripts of the javascript adapter (default: false). */
+    allowScriptChange?: boolean;
+    /** Adapters or instances `send_to` may address, comma separated, `*` for all (default: none, no tool). */
+    sendToAllowlist?: string;
+    /** Ask the user before dangerous actions if the client supports elicitation (default: true). */
+    confirmDangerous?: boolean;
     /** Name reported to the server by the embedded client. */
     clientName?: string;
     /** Version reported to the server by the embedded client. */
@@ -107,15 +117,8 @@ interface ToolContentBlock {
  * @returns a facade to list/call tools and to tear the connection down again
  */
 export async function createInProcessMcp(options: InProcessMcpOptions): Promise<InProcessMcp> {
-    const mcp = McpServer.createEmbedded({
-        adapter: options.adapter,
-        defaultUser: options.defaultUser,
-        language: options.language,
-        allowSetState: options.allowSetState,
-        allowObjectChange: options.allowObjectChange,
-        setStateDestructive: options.setStateDestructive,
-        allowPackageInstall: options.allowPackageInstall,
-    });
+    const { clientName, clientVersion, ...embedOptions } = options;
+    const mcp = McpServer.createEmbedded(embedOptions);
 
     const server = mcp.createInProcessServer();
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -123,8 +126,8 @@ export async function createInProcessMcp(options: InProcessMcpOptions): Promise<
 
     const client = new Client(
         {
-            name: options.clientName || 'iobroker-inprocess-client',
-            version: options.clientVersion || '1.0.0',
+            name: clientName || 'iobroker-inprocess-client',
+            version: clientVersion || '1.0.0',
         },
         { capabilities: {} },
     );

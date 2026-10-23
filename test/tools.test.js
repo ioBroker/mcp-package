@@ -767,3 +767,419 @@ describe('install_package', () => {
         assert.equal(ctx.cmdExec.sent.length, 0);
     });
 });
+
+describe('instance control', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+        ctx.objects['system.adapter.hue.0'] = {
+            _id: 'system.adapter.hue.0',
+            type: 'instance',
+            common: { name: 'hue', enabled: true, host: 'testhost', loglevel: 'info' },
+            native: { bridge: '1.2.3.4' },
+        };
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('stop_instance and start_instance toggle common.enabled', async () => {
+        let data = await callOk(ctx.mcp, 'stop_instance', { id: 'hue.0' });
+        assert.deepEqual(data, { id: 'hue.0', enabled: false, changed: true });
+        assert.equal(ctx.objects['system.adapter.hue.0'].common.enabled, false);
+        assert.equal(ctx.objects['system.adapter.hue.0'].native.bridge, '1.2.3.4', 'native was lost');
+
+        data = await callOk(ctx.mcp, 'start_instance', { id: 'system.adapter.hue.0' });
+        assert.equal(data.changed, true);
+        assert.equal(ctx.objects['system.adapter.hue.0'].common.enabled, true);
+
+        data = await callOk(ctx.mcp, 'start_instance', { id: 'hue.0' });
+        assert.equal(data.changed, false);
+    });
+
+    it('restart_instance touches the instance object, but only of a running instance', async () => {
+        await callOk(ctx.mcp, 'restart_instance', { id: 'hue.0' });
+        assert.deepEqual(ctx.extended, ['system.adapter.hue.0']);
+
+        ctx.objects['system.adapter.hue.0'].common.enabled = false;
+        const result = await call(ctx.mcp, 'restart_instance', { id: 'hue.0' });
+        assert.equal(result.isError, true);
+        assert.match(result.json.error, /not enabled/);
+    });
+
+    it('set_log_level writes the logLevel state or the instance object', async () => {
+        await callOk(ctx.mcp, 'set_log_level', { id: 'hue.0', level: 'debug' });
+        assert.equal(ctx.states['system.adapter.hue.0.logLevel'].val, 'debug');
+        assert.equal(ctx.states['system.adapter.hue.0.logLevel'].ack, false);
+        assert.equal(ctx.objects['system.adapter.hue.0'].common.loglevel, 'info');
+
+        await callOk(ctx.mcp, 'set_log_level', { id: 'hue.0', level: 'warn', persistent: true });
+        assert.equal(ctx.objects['system.adapter.hue.0'].common.loglevel, 'warn');
+    });
+
+    it('refuses unknown or invalid instances', async () => {
+        for (const id of ['nope.0', 'hue', 'hue.0; rm -rf']) {
+            const result = await call(ctx.mcp, 'start_instance', { id });
+            assert.equal(result.isError, true, `accepted ${id}`);
+        }
+    });
+});
+
+describe('adapter management', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+        ctx.objects['system.adapter.hue'] = {
+            _id: 'system.adapter.hue',
+            type: 'adapter',
+            common: { name: 'hue', version: '3.8.0', titleLang: { en: 'Philips Hue' } },
+            native: {},
+        };
+        ctx.objects['system.adapter.hue.0'] = {
+            _id: 'system.adapter.hue.0',
+            type: 'instance',
+            common: { name: 'hue', enabled: true, host: 'testhost' },
+            native: {},
+        };
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('list_adapter_updates compares the installed with the repository version', async () => {
+        const data = await callOk(ctx.mcp, 'list_adapter_updates', {});
+        assert.deepEqual(data.updates, [{ name: 'hue', installed: '3.8.0', available: '3.9.0', title: 'Philips Hue' }]);
+    });
+
+    it('add_instance runs "iobroker add" on the host', async () => {
+        const data = await callOk(ctx.mcp, 'add_instance', { adapter: 'zigbee', instance: 1 });
+        assert.equal(ctx.cmdExec.sent[0].data, 'add zigbee 1 --host testhost');
+        assert.equal(data.success, true);
+
+        const result = await call(ctx.mcp, 'add_instance', { adapter: 'hue', instance: 0 });
+        assert.equal(result.isError, true);
+        assert.match(result.json.error, /already exists/);
+    });
+
+    it('delete_instance runs "iobroker del" on the host of the instance', async () => {
+        await callOk(ctx.mcp, 'delete_instance', { id: 'hue.0' });
+        assert.equal(ctx.cmdExec.sent[0].host, 'system.host.testhost');
+        assert.equal(ctx.cmdExec.sent[0].data, 'del hue.0');
+    });
+
+    it('upgrade_adapter upgrades to the repository or the given version', async () => {
+        await callOk(ctx.mcp, 'upgrade_adapter', { adapter: 'iobroker.hue' });
+        assert.equal(ctx.cmdExec.sent[0].data, 'upgrade hue@3.9.0');
+        await callOk(ctx.mcp, 'upgrade_adapter', { adapter: 'hue', version: '3.9.1-beta.0' });
+        assert.equal(ctx.cmdExec.sent[1].data, 'upgrade hue@3.9.1-beta.0');
+    });
+
+    it('refuses invalid adapters and versions', async () => {
+        for (const [name, args] of [
+            ['add_instance', { adapter: 'hue --force' }],
+            ['upgrade_adapter', { adapter: 'zigbee' }],
+            ['upgrade_adapter', { adapter: 'hue', version: '1.0.0 --force' }],
+            ['delete_instance', { id: 'nope.0' }],
+        ]) {
+            const result = await call(ctx.mcp, name, args);
+            assert.equal(result.isError, true, `${name} accepted ${JSON.stringify(args)}`);
+        }
+        assert.equal(ctx.cmdExec.sent.length, 0);
+    });
+});
+
+describe('notifications', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('list_notifications flattens the notifications of the running hosts', async () => {
+        const data = await callOk(ctx.mcp, 'list_notifications', { language: 'de' });
+        assert.deepEqual(data.notifications, [
+            {
+                host: 'testhost',
+                scope: 'system',
+                category: 'diskSpaceIssues',
+                instance: 'system.host.testhost',
+                severity: 'alert',
+                name: 'Speicherplatz knapp',
+                description: 'Free some space',
+                messages: [{ message: 'Only 2 % left', ts: 1_750_000_000_000 }],
+            },
+        ]);
+    });
+
+    it('clear_notifications forwards the filter to the host', async () => {
+        await callOk(ctx.mcp, 'clear_notifications', { scope: 'system', instance: 'hue.0' });
+        assert.deepEqual(ctx.messages.notificationsCleared, [
+            {
+                host: 'system.host.testhost',
+                scope: 'system',
+                category: null,
+                instance: 'system.adapter.hue.0',
+            },
+        ]);
+    });
+});
+
+describe('scripts', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+        ctx.objects['system.adapter.javascript.0'] = {
+            _id: 'system.adapter.javascript.0',
+            type: 'instance',
+            common: { name: 'javascript', enabled: true },
+            native: {},
+        };
+        ctx.objects['script.js.common'] = { _id: 'script.js.common', type: 'channel', common: { name: 'common' } };
+        ctx.objects['script.js.common.lights'] = {
+            _id: 'script.js.common.lights',
+            type: 'script',
+            common: {
+                name: 'Lights',
+                engineType: 'Javascript/js',
+                enabled: true,
+                engine: 'system.adapter.javascript.0',
+                source: 'log("on");',
+            },
+            native: {},
+        };
+        ctx.objects['script.js.common.blocks'] = {
+            _id: 'script.js.common.blocks',
+            type: 'script',
+            common: { name: 'Blocks', engineType: 'Blockly', enabled: false, source: '//xml' },
+            native: {},
+        };
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('list_scripts lists the scripts without source', async () => {
+        const data = await callOk(ctx.mcp, 'list_scripts', {});
+        assert.deepEqual(
+            data.scripts.map(script => script.id),
+            ['script.js.common.lights', 'script.js.common.blocks'],
+        );
+        assert.equal(data.scripts[0].engine, 'javascript.0');
+        assert.equal(data.scripts[0].source, undefined);
+    });
+
+    it('get_script returns the source and accepts short ids', async () => {
+        const data = await callOk(ctx.mcp, 'get_script', { id: 'lights' });
+        assert.equal(data.id, 'script.js.common.lights');
+        assert.equal(data.source, 'log("on");');
+    });
+
+    it('set_script creates a disabled script with its folders', async () => {
+        const data = await callOk(ctx.mcp, 'set_script', { id: 'garden.water pump', source: 'log(1);' });
+        assert.deepEqual(data, { id: 'script.js.garden.water_pump', created: true });
+        assert.equal(ctx.objects['script.js.garden'].type, 'channel');
+        const common = ctx.objects['script.js.garden.water_pump'].common;
+        assert.equal(common.enabled, false);
+        assert.equal(common.engine, 'system.adapter.javascript.0');
+        assert.equal(common.engineType, 'Javascript/js');
+        assert.equal(common.source, 'log(1);');
+    });
+
+    it('set_script changes the source of a JavaScript, but not of a Blockly script', async () => {
+        await callOk(ctx.mcp, 'set_script', { id: 'common.lights', source: 'log("off");' });
+        assert.equal(ctx.objects['script.js.common.lights'].common.source, 'log("off");');
+        assert.equal(ctx.objects['script.js.common.lights'].common.enabled, true);
+
+        const result = await call(ctx.mcp, 'set_script', { id: 'common.blocks', source: 'x' });
+        assert.equal(result.isError, true);
+        assert.match(result.json.error, /Blockly/);
+    });
+
+    it('enable_script and delete_script', async () => {
+        await callOk(ctx.mcp, 'enable_script', { id: 'common.lights', enabled: false });
+        assert.equal(ctx.objects['script.js.common.lights'].common.enabled, false);
+        await callOk(ctx.mcp, 'delete_script', { id: 'script.js.common.lights' });
+        assert.equal(ctx.objects['script.js.common.lights'], undefined);
+    });
+
+    it('run_script sends the code to the javascript adapter', async () => {
+        const data = await callOk(ctx.mcp, 'run_script', { source: 'log(1)', timeout: 100 });
+        assert.equal(data.output, 'ran log(1)');
+        const sent = ctx.messages.sent[0];
+        assert.equal(sent.instance, 'javascript.0');
+        assert.equal(sent.command, 'execute');
+        assert.equal(sent.message.timeout, 100);
+        assert.equal(sent.options.user, 'system.user.admin');
+    });
+});
+
+describe('send_to', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+        for (const id of ['telegram.0', 'backitup.0', 'backitup.1', 'hue.0']) {
+            ctx.objects[`system.adapter.${id}`] = {
+                _id: `system.adapter.${id}`,
+                type: 'instance',
+                common: { name: id.split('.')[0], enabled: true },
+                native: {},
+            };
+        }
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('sends to allowed adapters and instances and returns the answer', async () => {
+        const data = await callOk(ctx.mcp, 'send_to', {
+            instance: 'telegram.0',
+            command: 'send',
+            message: { text: 'Hi' },
+        });
+        assert.deepEqual(data, { instance: 'telegram.0', command: 'send', response: { echo: { text: 'Hi' } } });
+        await callOk(ctx.mcp, 'send_to', { instance: 'backitup.0', command: 'oneClick' });
+    });
+
+    it('refuses instances outside the allowlist', async () => {
+        for (const instance of ['backitup.1', 'hue.0']) {
+            const result = await call(ctx.mcp, 'send_to', { instance, command: 'x' });
+            assert.equal(result.isError, true, `sent to ${instance}`);
+            assert.match(result.json.error, /allowlist/);
+        }
+        assert.equal(ctx.messages.sent.length, 0);
+    });
+});
+
+describe('create_alias', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('creates an alias with the metadata of the target', async () => {
+        const data = await callOk(ctx.mcp, 'create_alias', {
+            id: 'livingroom.brightness',
+            target: 'hue.0.light.brightness',
+        });
+        assert.equal(data.id, 'alias.0.livingroom.brightness');
+        const common = ctx.objects['alias.0.livingroom.brightness'].common;
+        assert.equal(common.alias.id, 'hue.0.light.brightness');
+        assert.equal(common.type, 'number');
+        assert.equal(common.role, 'level.dimmer');
+        assert.equal(common.unit, ctx.objects['hue.0.light.brightness'].common.unit);
+    });
+
+    it('supports separate read and write states and refuses duplicates', async () => {
+        await callOk(ctx.mcp, 'create_alias', {
+            id: 'alias.0.lamp',
+            target: 'hue.0.light.state',
+            write_target: 'hue.0.light.brightness',
+            name: 'Lamp',
+        });
+        assert.deepEqual(ctx.objects['alias.0.lamp'].common.alias.id, {
+            read: 'hue.0.light.state',
+            write: 'hue.0.light.brightness',
+        });
+        const result = await call(ctx.mcp, 'create_alias', { id: 'lamp', target: 'hue.0.light.state' });
+        assert.equal(result.isError, true);
+        assert.match(result.json.error, /already exists/);
+    });
+});
+
+describe('prompts and confirmations', () => {
+    const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
+    const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
+    const { ElicitRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
+    const { McpServer } = require('../build/index.js');
+    const { createMockAdapter } = require('./mockAdapter');
+
+    /** Connect an SDK client that supports elicitation and answers it with `answer`. */
+    async function connect(answer, options = {}) {
+        const mock = createMockAdapter();
+        const mcp = McpServer.createEmbedded({ adapter: mock.adapter, allowObjectChange: true, ...options });
+        const server = mcp.createInProcessServer();
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        await server.connect(serverTransport);
+        const client = new Client({ name: 'test', version: '1.0.0' }, { capabilities: { elicitation: {} } });
+        const asked = [];
+        client.setRequestHandler(ElicitRequestSchema, request => {
+            asked.push(request.params.message);
+            return answer;
+        });
+        await client.connect(clientTransport);
+        const close = async () => {
+            await client.close();
+            await server.close();
+            mcp.unload();
+        };
+        return { mock, client, asked, close };
+    }
+
+    it('asks before deleting and stops when the user declines', async () => {
+        const ctx = await connect({ action: 'decline' });
+        try {
+            const result = await ctx.client.callTool({ name: 'delete_object', arguments: { id: 'hue.0.light' } });
+            assert.equal(result.isError, true);
+            assert.match(result.content[0].text, /Cancelled by the user/);
+            assert.ok(ctx.mock.objects['hue.0.light'], 'deleted although declined');
+            assert.match(ctx.asked[0], /hue\.0\.light/);
+        } finally {
+            await ctx.close();
+        }
+    });
+
+    it('deletes after the user confirmed', async () => {
+        const ctx = await connect({ action: 'accept', content: { confirm: true } });
+        try {
+            const result = await ctx.client.callTool({ name: 'delete_object', arguments: { id: 'hue.0.light' } });
+            assert.equal(result.isError, undefined);
+            assert.equal(ctx.mock.objects['hue.0.light'], undefined);
+        } finally {
+            await ctx.close();
+        }
+    });
+
+    it('does not ask when confirmDangerous is off', async () => {
+        const ctx = await connect({ action: 'decline' }, { confirmDangerous: false });
+        try {
+            await ctx.client.callTool({ name: 'delete_object', arguments: { id: 'hue.0.light' } });
+            assert.equal(ctx.asked.length, 0);
+            assert.equal(ctx.mock.objects['hue.0.light'], undefined);
+        } finally {
+            await ctx.close();
+        }
+    });
+
+    it('offers the prompts', async () => {
+        const ctx = await connect({ action: 'decline' });
+        try {
+            const { prompts } = await ctx.client.listPrompts();
+            assert.deepEqual(prompts.map(prompt => prompt.name).sort(), [
+                'create_automation',
+                'diagnose_adapter',
+                'room_overview',
+            ]);
+            const prompt = await ctx.client.getPrompt({ name: 'diagnose_adapter', arguments: { instance: 'hue.0' } });
+            assert.match(prompt.messages[0].content.text, /"hue\.0"/);
+        } finally {
+            await ctx.close();
+        }
+    });
+});

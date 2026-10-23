@@ -11,39 +11,60 @@ const { startMcp, startMcpWithDefaults } = require('./helpers');
 
 /** Every tool the server registers when all permission toggles are on. */
 const ALL_TOOLS = [
+    'add_instance',
+    'clear_notifications',
+    'create_alias',
     'create_scene',
     'create_state',
     'delete_file',
+    'delete_instance',
     'delete_object',
+    'delete_script',
+    'enable_script',
     'file_exists',
     'get_logs',
     'get_object',
+    'get_script',
     'get_states',
     'history_query',
     'install_package',
+    'list_adapter_updates',
     'list_adapters',
     'list_devices',
     'list_files',
     'list_functions',
     'list_hosts',
     'list_instances',
+    'list_notifications',
     'list_rooms',
+    'list_scripts',
     'mkdir',
     'ping_host',
     'read_file',
     'rename_file',
+    'restart_instance',
+    'run_script',
     'search_adapter_repository',
     'search_objects',
+    'send_to',
+    'set_log_level',
     'set_object',
+    'set_script',
     'set_state',
     'set_states',
+    'start_instance',
+    'stop_instance',
     'system_info',
+    'upgrade_adapter',
     'write_file',
     'write_log',
 ];
 
 /** Tools gated behind `allowSetState`. */
-const STATE_WRITE_TOOLS = ['set_state', 'set_states'];
+const STATE_WRITE_TOOLS = ['set_state', 'set_states', 'clear_notifications'];
+
+/** The state-writing tools whose destructive hint `setStateDestructive` controls. */
+const SET_STATE_TOOLS = ['set_state', 'set_states'];
 
 /** Tools gated behind `allowObjectChange`. */
 const OBJECT_CHANGE_TOOLS = [
@@ -51,6 +72,7 @@ const OBJECT_CHANGE_TOOLS = [
     'delete_object',
     'create_state',
     'create_scene',
+    'create_alias',
     'write_file',
     'delete_file',
     'rename_file',
@@ -59,6 +81,19 @@ const OBJECT_CHANGE_TOOLS = [
 
 /** Tools gated behind `allowPackageInstall`. */
 const PACKAGE_INSTALL_TOOLS = ['install_package'];
+
+/** Every opt-in permission with the tools it unlocks. */
+const OPT_IN_TOOLS = {
+    allowObjectChange: OBJECT_CHANGE_TOOLS,
+    allowInstanceControl: ['start_instance', 'stop_instance', 'restart_instance', 'set_log_level'],
+    allowAdapterManagement: ['add_instance', 'delete_instance', 'upgrade_adapter'],
+    allowPackageInstall: PACKAGE_INSTALL_TOOLS,
+    allowScriptChange: ['set_script', 'enable_script', 'delete_script', 'run_script'],
+    sendToAllowlist: ['send_to'],
+};
+
+/** Tools that talk to the world outside of ioBroker (network, npm, other adapters' services). */
+const OPEN_WORLD_TOOLS = ['ping_host', 'install_package', 'add_instance', 'upgrade_adapter', 'send_to'];
 
 /** Tools that must not modify anything. */
 const READ_ONLY_TOOLS = [
@@ -79,6 +114,10 @@ const READ_ONLY_TOOLS = [
     'read_file',
     'list_files',
     'file_exists',
+    'list_adapter_updates',
+    'list_notifications',
+    'list_scripts',
+    'get_script',
 ];
 
 describe('tool metadata', () => {
@@ -140,16 +179,17 @@ describe('tool metadata', () => {
             assert.equal(byName[name].annotations.readOnlyHint, true, `${name} should be read-only`);
             assert.equal(byName[name].annotations.destructiveHint, false, `${name} must not be destructive`);
         }
-        for (const name of [...STATE_WRITE_TOOLS, ...OBJECT_CHANGE_TOOLS, ...PACKAGE_INSTALL_TOOLS, 'write_log']) {
+        const writing = [...STATE_WRITE_TOOLS, ...Object.values(OPT_IN_TOOLS).flat(), 'write_log'];
+        for (const name of writing) {
             assert.equal(byName[name].annotations.readOnlyHint, false, `${name} must not be read-only`);
         }
     });
 
-    it('flags only ping_host and install_package as talking to the outside world', () => {
+    it('flags only the network, npm and send_to tools as talking to the outside world', () => {
         for (const tool of tools) {
             assert.equal(
                 tool.annotations.openWorldHint,
-                tool.name === 'ping_host' || tool.name === 'install_package',
+                OPEN_WORLD_TOOLS.includes(tool.name),
                 `${tool.name}: unexpected openWorldHint`,
             );
         }
@@ -169,11 +209,10 @@ describe('tool metadata', () => {
             for (const name of STATE_WRITE_TOOLS) {
                 assert.ok(names.includes(name), `${name} must be offered by default - allowSetState is opt-out`);
             }
-            for (const name of OBJECT_CHANGE_TOOLS) {
-                assert.ok(!names.includes(name), `${name} must stay off by default - allowObjectChange is opt-in`);
-            }
-            for (const name of PACKAGE_INSTALL_TOOLS) {
-                assert.ok(!names.includes(name), `${name} must stay off by default - allowPackageInstall is opt-in`);
+            for (const [option, optInTools] of Object.entries(OPT_IN_TOOLS)) {
+                for (const name of optInTools) {
+                    assert.ok(!names.includes(name), `${name} must stay off by default - ${option} is opt-in`);
+                }
             }
         } finally {
             await defaults.close();
@@ -195,7 +234,7 @@ describe('tool metadata', () => {
 
     it('declares the state-writing tools destructive by default', () => {
         const byName = Object.fromEntries(tools.map(tool => [tool.name, tool]));
-        for (const name of STATE_WRITE_TOOLS) {
+        for (const name of SET_STATE_TOOLS) {
             assert.equal(byName[name].annotations.destructiveHint, true, `${name} must be destructive by default`);
         }
     });
@@ -204,7 +243,7 @@ describe('tool metadata', () => {
         const { mcp: relaxed } = await startMcp({ setStateDestructive: false });
         try {
             const byName = Object.fromEntries((await relaxed.listTools()).map(tool => [tool.name, tool]));
-            for (const name of STATE_WRITE_TOOLS) {
+            for (const name of SET_STATE_TOOLS) {
                 assert.equal(byName[name].annotations.destructiveHint, false, `${name} must not be destructive`);
                 assert.equal(byName[name].annotations.readOnlyHint, false, `${name} still writes`);
             }
@@ -225,18 +264,23 @@ describe('tool metadata', () => {
             await limited.close();
         }
     });
-    it('hides install_package when allowPackageInstall is off', async () => {
-        const { mcp: limited } = await startMcp({ allowPackageInstall: false });
-        try {
-            const names = (await limited.listTools()).map(tool => tool.name);
-            for (const name of PACKAGE_INSTALL_TOOLS) {
-                assert.ok(!names.includes(name), `${name} must not be offered when allowPackageInstall is off`);
+    for (const [option, optInTools] of Object.entries(OPT_IN_TOOLS)) {
+        it(`hides only its own tools when ${option} is off`, async () => {
+            const { mcp: limited } = await startMcp({ [option]: option === 'sendToAllowlist' ? '' : false });
+            try {
+                const names = (await limited.listTools()).map(tool => tool.name);
+                for (const name of ALL_TOOLS) {
+                    assert.equal(
+                        names.includes(name),
+                        !optInTools.includes(name),
+                        `${name} ${optInTools.includes(name) ? 'must not' : 'must'} be offered when ${option} is off`,
+                    );
+                }
+            } finally {
+                await limited.close();
             }
-            assert.ok(names.includes('set_object'), 'the other tools stay available');
-        } finally {
-            await limited.close();
-        }
-    });
+        });
+    }
 
     /**
      * Both assertions below guard against a split zod installation. The MCP SDK converts and

@@ -16,6 +16,10 @@ async function startMcp(options = {}) {
         allowSetState: true,
         allowObjectChange: true,
         allowPackageInstall: true,
+        allowInstanceControl: true,
+        allowAdapterManagement: true,
+        allowScriptChange: true,
+        sendToAllowlist: 'telegram, backitup.0',
         clientName: 'mcp-test-client',
         ...options,
     });

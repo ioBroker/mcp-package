@@ -177,6 +177,28 @@ function createMockAdapter() {
     const cmdExec = { sent: [], exitCode: 0, reply: true };
     /** Ids of the objects touched via `extendForeignObjectAsync` (instance restarts). */
     const extended = [];
+    /** Messages sent with `sendToAsync`, and the notifications the host reports and clears. */
+    const messages = { sent: [], notificationsCleared: [] };
+    const notifications = {
+        system: {
+            name: { en: 'System', de: 'System' },
+            categories: {
+                diskSpaceIssues: {
+                    name: { en: 'Disk space low', de: 'Speicherplatz knapp' },
+                    description: { en: 'Free some space' },
+                    severity: 'alert',
+                    instances: {
+                        'system.host.testhost': { messages: [{ message: 'Only 2 % left', ts: 1_750_000_000_000 }] },
+                    },
+                },
+                emptyCategory: {
+                    name: { en: 'Nothing' },
+                    severity: 'info',
+                    instances: { 'system.adapter.hue.0': { messages: [] } },
+                },
+            },
+        },
+    };
     const listeners = {};
     const subscriptions = { states: [], objects: [], log: [] };
     /** Merged group permissions per user, as returned by `calculatePermissionsAsync`. */
@@ -273,7 +295,13 @@ function createMockAdapter() {
         },
         extendForeignObjectAsync(id, obj) {
             extended.push(id);
-            objects[id] = { ...objects[id], ...obj };
+            const existing = objects[id] || {};
+            objects[id] = {
+                ...existing,
+                ...obj,
+                common: { ...existing.common, ...obj.common },
+                native: { ...existing.native, ...obj.native },
+            };
             return Promise.resolve({ id });
         },
         setForeignObjectAsync(id, obj) {
@@ -376,6 +404,15 @@ function createMockAdapter() {
                 callback(hostLogs.slice());
                 return;
             }
+            if (command === 'getNotifications') {
+                callback({ result: JSON.parse(JSON.stringify(notifications)) });
+                return;
+            }
+            if (command === 'clearNotifications') {
+                messages.notificationsCleared.push({ host, ...message });
+                callback({ result: 'ok' });
+                return;
+            }
             if (command === 'cmdExec') {
                 // the host answers asynchronously with messages to the sending instance
                 cmdExec.sent.push({ host, ...message });
@@ -415,6 +452,18 @@ function createMockAdapter() {
             subscriptions.objects = subscriptions.objects.filter(one => one !== pattern);
             return Promise.resolve();
         },
+        sendToAsync(instance, command, message, options) {
+            messages.sent.push({ instance, command, message, options });
+            if (command === 'execute') {
+                return Promise.resolve({
+                    ok: true,
+                    engineType: message.engineType || 'Javascript/js',
+                    logs: [{ ts: 1, severity: 'info', message: `ran ${message.source}` }],
+                    output: `ran ${message.source}`,
+                });
+            }
+            return Promise.resolve({ echo: message });
+        },
         supportsFeature(feature) {
             return feature === 'CONTROLLER_CMD_EXEC_FILES';
         },
@@ -428,7 +477,7 @@ function createMockAdapter() {
         },
     };
 
-    return { adapter, objects, states, files, logged, subscriptions, permissions, cmdExec, extended };
+    return { adapter, objects, states, files, logged, subscriptions, permissions, cmdExec, extended, messages };
 }
 
 module.exports = { createMockAdapter, patternToRegExp };

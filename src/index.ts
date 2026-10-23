@@ -19,7 +19,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { getAiFriendlyStructure, type Room } from './devices';
 import { iobUriParse } from './iob-uri';
-import type { McpConfig } from './types';
+import { PERMISSION_KEYS, type McpConfig, type McpPermissions } from './types';
 import { createInProcessMcp } from './inProcessClient';
 import packageJson from '../package.json';
 
@@ -180,6 +180,30 @@ function extractAdapterName(source: string): string | null {
     return null;
 }
 
+/**
+ * Compare two versions like `3.9.0` and `3.10.0-alpha.1`: > 0 if `a` is newer, < 0 if `b` is newer.
+ * A pre-release is older than the release with the same numbers.
+ */
+function compareVersions(a: string, b: string): number {
+    const [mainA, preA] = (a || '0').split('-', 2);
+    const [mainB, preB] = (b || '0').split('-', 2);
+    const partsA = mainA.split('.').map(part => parseInt(part, 10) || 0);
+    const partsB = mainB.split('.').map(part => parseInt(part, 10) || 0);
+    for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
+        const diff = (partsA[i] || 0) - (partsB[i] || 0);
+        if (diff) {
+            return diff;
+        }
+    }
+    if (preA === preB) {
+        return 0;
+    }
+    if (!preA || !preB) {
+        return preA ? -1 : 1;
+    }
+    return preA.localeCompare(preB, undefined, { numeric: true });
+}
+
 export default class McpServer {
     private readonly adapter: ioBroker.Adapter;
     /** The Express app we attach routes to. Undefined in embedded in-process mode (no HTTP). */
@@ -220,6 +244,7 @@ export default class McpServer {
 
     constructor(
         server: HttpServer | HttpsServer | null,
+        // The permission toggles are explicit overrides for embedded mode (see `McpPermissions`)
         webSettings: {
             // `secure`/`port`/`auth` are accepted for backwards compatibility but not read here;
             // the HTTP specifics come from the adapter config. `defaultUser` accepts a plain user
@@ -229,15 +254,7 @@ export default class McpServer {
             defaultUser?: string;
             auth?: boolean;
             language?: ioBroker.Languages;
-            /** Explicit override for the `set_state`/`set_states` permission (embedded mode). */
-            allowSetState?: boolean;
-            /** Explicit override for the destructive hint of `set_state`/`set_states` (embedded mode). */
-            setStateDestructive?: boolean;
-            /** Explicit override for the object/file-changing tool permission (embedded mode). */
-            allowObjectChange?: boolean;
-            /** Explicit override for the package installation permission (embedded mode). */
-            allowPackageInstall?: boolean;
-        },
+        } & Partial<McpPermissions>,
         adapter: ioBroker.Adapter,
         instanceSettings: ioBroker.InstanceObject | null,
         app?: Express,
@@ -263,23 +280,22 @@ export default class McpServer {
         this.language = webSettings.language || 'en';
 
         // Embedded callers may set the permission toggles explicitly (they don't read the mcp config).
-        if (webSettings.allowSetState !== undefined) {
-            this.config.allowSetState = webSettings.allowSetState;
+        for (const key of PERMISSION_KEYS) {
+            if (webSettings[key] !== undefined) {
+                (this.config as Partial<McpPermissions>)[key] = webSettings[key] as any;
+            }
         }
-        if (webSettings.allowObjectChange !== undefined) {
-            this.config.allowObjectChange = webSettings.allowObjectChange;
-        }
-        if (webSettings.setStateDestructive !== undefined) {
-            this.config.setStateDestructive = webSettings.setStateDestructive;
-        }
-        if (webSettings.allowPackageInstall !== undefined) {
-            this.config.allowPackageInstall = webSettings.allowPackageInstall;
-        }
-        // Permission toggles: state writes are allowed by default, object/file changes and
-        // package installation are not.
+        // Permission toggles: state writes are allowed by default, everything that changes the
+        // system (objects, instances, adapters, packages, scripts, messages) is not.
         this.config.allowSetState = this.config.allowSetState !== false;
         this.config.allowObjectChange = this.config.allowObjectChange === true;
+        this.config.allowInstanceControl = this.config.allowInstanceControl === true;
+        this.config.allowAdapterManagement = this.config.allowAdapterManagement === true;
         this.config.allowPackageInstall = this.config.allowPackageInstall === true;
+        this.config.allowScriptChange = this.config.allowScriptChange === true;
+        this.config.sendToAllowlist = (this.config.sendToAllowlist || '').trim();
+        // Confirmations via elicitation are on unless turned off explicitly
+        this.config.confirmDangerous = this.config.confirmDangerous !== false;
         // State writes are declared destructive unless turned off explicitly
         this.config.setStateDestructive = this.config.setStateDestructive !== false;
 
@@ -309,8 +325,8 @@ export default class McpServer {
 
         // Receive ioBroker log messages (only forwarded once a session subscribes via requireLog).
         this.adapter.on('log', this.onLog);
-        if (this.config.allowPackageInstall) {
-            // The host reports the progress of `cmdExec` (install_package) as messages to this instance
+        if (this.config.allowPackageInstall || this.config.allowAdapterManagement) {
+            // The host reports the progress of `cmdExec` (install_package etc.) as messages to this instance
             this.adapter.on('message', this.onMessage);
         }
 
@@ -338,35 +354,16 @@ export default class McpServer {
      * @param options.adapter The host adapter into which the MCP server is embedded. Used for receiving state/object changes and logs, and for performing actions with the host adapter's permissions.
      * @param options.defaultUser Default user
      * @param options.language Language
-     * @param options.allowSetState Allow the state-writing tools `set_state`/`set_states` (opt-out, default true)
-     * @param options.allowObjectChange Allow the object/file-changing tools (opt-in, default false)
-     * @param options.setStateDestructive Declare `set_state`/`set_states` as destructive (default true)
-     * @param options.allowPackageInstall Allow the `install_package` tool (opt-in, default false, developers only)
      */
-    static createEmbedded(options: {
-        adapter: ioBroker.Adapter;
-        defaultUser?: `system.user.${string}`;
-        language?: ioBroker.Languages;
-        allowSetState?: boolean;
-        allowObjectChange?: boolean;
-        setStateDestructive?: boolean;
-        allowPackageInstall?: boolean;
-    }): McpServer {
-        return new McpServer(
-            null,
-            {
-                secure: false,
-                port: 0,
-                defaultUser: options.defaultUser,
-                language: options.language,
-                allowSetState: options.allowSetState,
-                allowObjectChange: options.allowObjectChange,
-                setStateDestructive: options.setStateDestructive,
-                allowPackageInstall: options.allowPackageInstall,
-            },
-            options.adapter,
-            null,
-        );
+    static createEmbedded(
+        options: {
+            adapter: ioBroker.Adapter;
+            defaultUser?: `system.user.${string}`;
+            language?: ioBroker.Languages;
+        } & Partial<McpPermissions>,
+    ): McpServer {
+        const { adapter, ...settings } = options;
+        return new McpServer(null, { secure: false, port: 0, ...settings }, adapter, null);
     }
 
     private initRoutes(): void {
@@ -901,6 +898,24 @@ export default class McpServer {
             const message = error instanceof Error ? error.message : String(error);
             this.adapter.log.warn(`MCP tool error: ${message}`);
             return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: message }) }], isError: true };
+        };
+        // Ask the user before a dangerous action, if the client can (MCP elicitation). Clients without
+        // elicitation rely on the destructiveHint of the tool instead.
+        const confirm = async (message: string): Promise<void> => {
+            if (!this.config.confirmDangerous || !server.server.getClientCapabilities()?.elicitation) {
+                return;
+            }
+            const answer = await server.server.elicitInput({
+                message,
+                requestedSchema: {
+                    type: 'object',
+                    properties: { confirm: { type: 'boolean', title: 'Yes, do it' } },
+                    required: ['confirm'],
+                },
+            });
+            if (answer.action !== 'accept' || answer.content?.confirm !== true) {
+                throw new Error('Cancelled by the user');
+            }
         };
 
         server.registerTool(
@@ -1492,6 +1507,7 @@ export default class McpServer {
                 },
                 async ({ id, recursive }) => {
                     try {
+                        await confirm(`Delete the object "${id}"${recursive ? ' and all its children' : ''}?`);
                         await this.deleteObject(id, recursive);
                         return ok({ ok: true, data: { id, deleted: true } });
                     } catch (e) {
@@ -1574,6 +1590,39 @@ export default class McpServer {
                 async args => {
                     try {
                         return ok({ ok: true, data: await this.createScene(args) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'create_alias',
+                {
+                    title: 'Create an alias',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: false,
+                        idempotentHint: false,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Create an alias state (alias.0.*) that points to another state, e.g. to give a device a ' +
+                        'stable, readable id that survives replacing the hardware. Type, role, unit and limits are ' +
+                        'copied from the target. With write_target, reading and writing use different states ' +
+                        '(e.g. a thermostat with separate actual and set values). Fails if the alias exists.',
+                    inputSchema: {
+                        id: z.string().describe('Alias id, e.g. "livingroom.ceiling_light" (becomes alias.0.…)'),
+                        target: z.string().describe('State the alias reads (and writes), e.g. "hue.0.light.state"'),
+                        write_target: z.string().optional().describe('Different state for writing'),
+                        name: z.string().optional().describe('Display name (default: name of the target)'),
+                        role: z.string().optional().describe('Role (default: role of the target)'),
+                        unit: z.string().optional().describe('Unit (default: unit of the target)'),
+                    },
+                },
+                async args => {
+                    try {
+                        return ok({ ok: true, data: await this.createAlias(args) });
                     } catch (e) {
                         return fail(e);
                     }
@@ -1689,6 +1738,324 @@ export default class McpServer {
             );
         }
 
+        server.registerTool(
+            'list_adapter_updates',
+            {
+                title: 'List adapter updates',
+                annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    'List the installed adapters that have a newer version in the active repository ' +
+                    '(installed and available version). Reads the already-downloaded repository (no network).',
+                inputSchema: {},
+            },
+            async () => {
+                try {
+                    return ok({ ok: true, data: { updates: await this.listAdapterUpdates() } });
+                } catch (e) {
+                    return fail(e);
+                }
+            },
+        );
+
+        server.registerTool(
+            'list_notifications',
+            {
+                title: 'List system notifications',
+                annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    'List the current system notifications of the hosts, as shown by the bell in ioBroker.admin ' +
+                    '(e.g. disk space low, adapter crashed repeatedly, adapter updates). Each entry has host, ' +
+                    'scope, category, severity, the affected instance and its messages.',
+                inputSchema: {
+                    host: z.string().optional().describe('Only this host (default: all running hosts)'),
+                    language: z.enum(LANGUAGES).optional().describe('Language for names and descriptions'),
+                },
+            },
+            async args => {
+                try {
+                    return ok({ ok: true, data: { notifications: await this.listNotifications(args) } });
+                } catch (e) {
+                    return fail(e);
+                }
+            },
+        );
+
+        server.registerTool(
+            'list_scripts',
+            {
+                title: 'List scripts',
+                annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    'List the scripts of the javascript adapter (JavaScript, TypeScript, Blockly, Rules) with ' +
+                    'id, name, type, whether they run, and the javascript instance - without the source.',
+                inputSchema: {
+                    folder: z.string().optional().describe('Only scripts in this folder, e.g. "common" or "lights"'),
+                },
+            },
+            async ({ folder }) => {
+                try {
+                    return ok({ ok: true, data: { scripts: await this.listScripts(folder) } });
+                } catch (e) {
+                    return fail(e);
+                }
+            },
+        );
+
+        server.registerTool(
+            'get_script',
+            {
+                title: 'Read a script',
+                annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description: 'Read a script of the javascript adapter including its source code',
+                inputSchema: {
+                    id: z.string().describe('Script id, e.g. "script.js.common.lights" or "common.lights"'),
+                },
+            },
+            async ({ id }) => {
+                try {
+                    const script = await this.getScriptObject(id);
+                    return ok({ ok: true, data: this.scriptInfo(script.id, script.obj, true) });
+                } catch (e) {
+                    return fail(e);
+                }
+            },
+        );
+
+        if (this.config.allowSetState) {
+            server.registerTool(
+                'clear_notifications',
+                {
+                    title: 'Acknowledge notifications',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: true,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Acknowledge (delete) system notifications of a host - all, or only those of one scope, ' +
+                        'category and/or instance as returned by list_notifications.',
+                    inputSchema: {
+                        host: z.string().optional().describe('Host (default: the host of this instance)'),
+                        scope: z.string().optional().describe('e.g. "system"'),
+                        category: z.string().optional().describe('e.g. "diskSpaceIssues"'),
+                        instance: z.string().optional().describe('e.g. "hue.0"'),
+                    },
+                },
+                async args => {
+                    try {
+                        return ok({ ok: true, data: await this.clearNotifications(args) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+        }
+
+        if (this.config.allowInstanceControl) {
+            const instanceSchema = { id: z.string().describe('Instance, e.g. "hue.0"') };
+            server.registerTool(
+                'start_instance',
+                {
+                    title: 'Start an instance',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: false,
+                        idempotentHint: true,
+                        openWorldHint: false,
+                    },
+                    description: 'Start (enable) an adapter instance',
+                    inputSchema: instanceSchema,
+                },
+                async ({ id }) => {
+                    try {
+                        return ok({ ok: true, data: await this.setInstanceEnabled(id, true) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'stop_instance',
+                {
+                    title: 'Stop an instance',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: true,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Stop (disable) an adapter instance. It stays stopped until it is started again, also ' +
+                        'after a restart of ioBroker.',
+                    inputSchema: instanceSchema,
+                },
+                async ({ id }) => {
+                    try {
+                        await confirm(`Stop the instance "${id}"?`);
+                        return ok({ ok: true, data: await this.setInstanceEnabled(id, false) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'restart_instance',
+                {
+                    title: 'Restart an instance',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: false,
+                        idempotentHint: false,
+                        openWorldHint: false,
+                    },
+                    description: 'Restart a running adapter instance, e.g. after changing its configuration',
+                    inputSchema: instanceSchema,
+                },
+                async ({ id }) => {
+                    try {
+                        return ok({ ok: true, data: await this.restartInstance(id) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'set_log_level',
+                {
+                    title: 'Set the log level of an instance',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: false,
+                        idempotentHint: true,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Change the log level of an adapter instance, e.g. to "debug" to analyze a problem with ' +
+                        'get_logs. By default only until the next start of the instance and without a restart; ' +
+                        'with persistent=true it is stored in the instance configuration (restarts the instance).',
+                    inputSchema: {
+                        id: z.string().describe('Instance, e.g. "hue.0"'),
+                        level: z.enum(['silly', 'debug', 'info', 'warn', 'error']),
+                        persistent: z.boolean().optional().describe('Store it permanently (default false)'),
+                    },
+                },
+                async ({ id, level, persistent }) => {
+                    try {
+                        return ok({ ok: true, data: await this.setLogLevel(id, level, persistent) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+        }
+
+        if (this.config.allowAdapterManagement) {
+            const timeoutSchema = z
+                .number()
+                .int()
+                .min(1)
+                .max(3600)
+                .optional()
+                .describe(
+                    `Seconds to wait (default ${DEFAULT_INSTALL_TIMEOUT}); the command keeps running on the host after that`,
+                );
+
+            server.registerTool(
+                'add_instance',
+                {
+                    title: 'Add an adapter instance',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: false,
+                        idempotentHint: false,
+                        openWorldHint: true,
+                    },
+                    description:
+                        'Create a new instance of an adapter from the repository (`iobroker add`). Installs the ' +
+                        'adapter first if it is not installed yet. Find adapters with search_adapter_repository.',
+                    inputSchema: {
+                        adapter: z.string().describe('Adapter name, e.g. "hue"'),
+                        instance: z.number().int().min(0).optional().describe('Instance number (default: next free)'),
+                        host: z.string().optional().describe('Host (default: the host of this instance)'),
+                        timeout: timeoutSchema,
+                    },
+                },
+                async args => {
+                    try {
+                        return ok({ ok: true, data: await this.addInstance(args) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'delete_instance',
+                {
+                    title: 'Delete an adapter instance',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: false,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Delete an adapter instance with its configuration, objects and states (`iobroker del`). ' +
+                        'This cannot be undone.',
+                    inputSchema: {
+                        id: z.string().describe('Instance, e.g. "hue.0"'),
+                        timeout: timeoutSchema,
+                    },
+                },
+                async args => {
+                    try {
+                        await confirm(
+                            `Delete the instance "${args.id}" with its configuration, objects and states? This cannot be undone.`,
+                        );
+                        return ok({ ok: true, data: await this.deleteInstance(args) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'upgrade_adapter',
+                {
+                    title: 'Upgrade an adapter',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: true,
+                        openWorldHint: true,
+                    },
+                    description:
+                        'Upgrade an installed adapter to the version of the active repository or to the given ' +
+                        'version (`iobroker upgrade`). Its instances are restarted. See list_adapter_updates.',
+                    inputSchema: {
+                        adapter: z.string().describe('Adapter name, e.g. "hue"'),
+                        version: z.string().optional().describe('Version (default: the repository version)'),
+                        host: z.string().optional().describe('Host (default: the host of this instance)'),
+                        timeout: timeoutSchema,
+                    },
+                },
+                async args => {
+                    try {
+                        await confirm(
+                            `Upgrade the adapter "${args.adapter}"${args.version ? ` to ${args.version}` : ''}?`,
+                        );
+                        return ok({ ok: true, data: await this.upgradeAdapter(args) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+        }
+
         // Installing packages runs arbitrary code on the host, so it is a separate opt-in for developers.
         if (this.config.allowPackageInstall) {
             server.registerTool(
@@ -1743,6 +2110,9 @@ export default class McpServer {
                 },
                 async args => {
                     try {
+                        await confirm(
+                            `Install the package "${args.source || args.file_path || args.file_name}"? It runs with full rights on the host.`,
+                        );
                         return ok({ ok: true, data: await this.installPackage(args) });
                     } catch (e) {
                         return fail(e);
@@ -1750,6 +2120,250 @@ export default class McpServer {
                 },
             );
         }
+
+        if (this.config.allowScriptChange) {
+            const engineTypeSchema = z
+                .enum(['Javascript/js', 'TypeScript/ts'])
+                .optional()
+                .describe('Script language (default "Javascript/js")');
+
+            server.registerTool(
+                'set_script',
+                {
+                    title: 'Create or change a script',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: true,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Create a JavaScript/TypeScript script of the javascript adapter or replace the source of ' +
+                        'an existing one (a running script restarts with the new source). New scripts are created ' +
+                        'disabled unless enabled=true; missing folders are created. Blockly and Rules scripts ' +
+                        'cannot be changed. Test code first with run_script.',
+                    inputSchema: {
+                        id: z.string().describe('Script id, e.g. "common.lights" (folder "common") or "lights"'),
+                        source: z.string().describe('The complete source code'),
+                        engineType: engineTypeSchema,
+                        name: z.string().optional().describe('Display name (default: last part of the id)'),
+                        enabled: z.boolean().optional().describe('Start (true) or stop (false) the script'),
+                        instance: z.string().optional().describe('javascript instance (default "javascript.0")'),
+                    },
+                },
+                async args => {
+                    try {
+                        await confirm(`Save the script "${args.id}"${args.enabled ? ' and start it' : ''}?`);
+                        return ok({ ok: true, data: await this.setScript(args) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'enable_script',
+                {
+                    title: 'Start or stop a script',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: false,
+                        idempotentHint: true,
+                        openWorldHint: false,
+                    },
+                    description: 'Start (enabled=true) or stop (enabled=false) a script of the javascript adapter',
+                    inputSchema: {
+                        id: z.string().describe('Script id, e.g. "script.js.common.lights"'),
+                        enabled: z.boolean(),
+                    },
+                },
+                async ({ id, enabled }) => {
+                    try {
+                        return ok({ ok: true, data: await this.enableScript(id, enabled) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'delete_script',
+                {
+                    title: 'Delete a script',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: true,
+                        openWorldHint: false,
+                    },
+                    description: 'Delete a script of the javascript adapter',
+                    inputSchema: { id: z.string().describe('Script id, e.g. "script.js.common.lights"') },
+                },
+                async ({ id }) => {
+                    try {
+                        await confirm(`Delete the script "${id}"?`);
+                        return ok({ ok: true, data: await this.deleteScript(id) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'run_script',
+                {
+                    title: 'Run code once',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: false,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Run JavaScript/TypeScript once in the javascript adapter, with the same API as a script ' +
+                        '(getState, setState, log, ...), and return everything it logged. Nothing is stored; ' +
+                        'timers and subscriptions end after `timeout`. Use it to test code before set_script. ' +
+                        'Requires javascript adapter 10.1.0 or newer.',
+                    inputSchema: {
+                        source: z.string().describe('The code, e.g. log(getState("hue.0.light.state").val)'),
+                        engineType: engineTypeSchema,
+                        timeout: z
+                            .number()
+                            .int()
+                            .min(0)
+                            .max(60000)
+                            .optional()
+                            .describe('Milliseconds to collect asynchronous output (default 5000)'),
+                        instance: z.string().optional().describe('javascript instance (default "javascript.0")'),
+                    },
+                },
+                async args => {
+                    try {
+                        await confirm('Run the code in the javascript adapter?');
+                        return ok({ ok: true, data: await this.runScript(args) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+        }
+
+        if (this.config.sendToAllowlist) {
+            server.registerTool(
+                'send_to',
+                {
+                    title: 'Send a message to an adapter',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: false,
+                        openWorldHint: true,
+                    },
+                    description:
+                        'Send a message to an adapter instance (`sendTo`) and return its answer, e.g. a Telegram ' +
+                        'message ({instance:"telegram.0", command:"send", message:{text:"Hi"}}) or a backup ' +
+                        `(backitup.0, "oneClick"). Allowed instances: ${this.config.sendToAllowlist}. The commands ` +
+                        'and the message format are described in the documentation of each adapter.',
+                    inputSchema: {
+                        instance: z.string().describe('Instance, e.g. "telegram.0"'),
+                        command: z.string().describe('Command, e.g. "send"'),
+                        message: z.any().optional().describe('Message payload (object or string)'),
+                        timeout: z
+                            .number()
+                            .int()
+                            .min(100)
+                            .max(120000)
+                            .optional()
+                            .describe('Milliseconds to wait for the answer (default 10000)'),
+                    },
+                },
+                async args => {
+                    try {
+                        await confirm(`Send "${args.command}" to "${args.instance}"?`);
+                        return ok({ ok: true, data: await this.sendToInstance(args) });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+        }
+
+        // --- Prompts: ready-made workflows that MCP clients offer as slash commands ---
+        server.registerPrompt(
+            'diagnose_adapter',
+            {
+                title: 'Diagnose an adapter',
+                description: 'Find out why an adapter instance does not work and suggest a fix',
+                argsSchema: { instance: z.string().describe('Instance, e.g. "hue.0"') },
+            },
+            ({ instance }) => ({
+                messages: [
+                    {
+                        role: 'user',
+                        content: {
+                            type: 'text',
+                            text:
+                                `Diagnose the ioBroker instance "${instance}". Check with list_instances whether it ` +
+                                `is enabled, alive and connected, read its errors and warnings with get_logs ` +
+                                `(adapter "${instance}"), look at list_notifications and, if the log names a device ` +
+                                `or service address, test it with ping_host. Compare its version with ` +
+                                `list_adapter_updates. Explain the cause in plain words and suggest the fix; ask ` +
+                                `before you change anything.`,
+                        },
+                    },
+                ],
+            }),
+        );
+
+        server.registerPrompt(
+            'room_overview',
+            {
+                title: 'Room overview',
+                description: 'Summarize the devices of a room and their current state',
+                argsSchema: { room: z.string().describe('Room name, e.g. "Living room"') },
+            },
+            ({ room }) => ({
+                messages: [
+                    {
+                        role: 'user',
+                        content: {
+                            type: 'text',
+                            text:
+                                `Give me an overview of the room "${room}" in ioBroker: use list_devices for the ` +
+                                `room and get_states for the current values. Group them into lights, climate, ` +
+                                `windows/doors and others and point out anything unusual (open windows, lights on, ` +
+                                `low batteries, unreachable devices).`,
+                        },
+                    },
+                ],
+            }),
+        );
+
+        server.registerPrompt(
+            'create_automation',
+            {
+                title: 'Create an automation',
+                description: 'Turn a description into an ioBroker script',
+                argsSchema: { description: z.string().describe('What should happen, e.g. "lights off at 23:00"') },
+            },
+            ({ description }) => ({
+                messages: [
+                    {
+                        role: 'user',
+                        content: {
+                            type: 'text',
+                            text:
+                                `Create an ioBroker automation: ${description}\n` +
+                                `Find the state ids with list_devices and search_objects, check the existing scripts ` +
+                                `with list_scripts and write a JavaScript for the javascript adapter (on(), ` +
+                                `schedule(), setState()). Test parts with run_script if available, show me the code ` +
+                                `and save it with set_script only after I agreed. If the script tools are not ` +
+                                `available, show me the code so I can paste it into the script editor.`,
+                        },
+                    },
+                ],
+            }),
+        );
 
         // --- Resources: expose states and objects via the canonical ioBroker URI scheme ---
         // States as `iobstate://<id>`, objects as `iobobject://<id>`. On change the server pushes a
@@ -2457,31 +3071,7 @@ export default class McpServer {
         const needle = (params.query || '').toLowerCase();
         const limit = params.limit ?? 20;
 
-        const reposObj = await this.adapter.getForeignObjectAsync('system.repositories', { user: this.defaultUser });
-        const repositories = (reposObj?.native?.repositories || {}) as Record<string, { json?: Record<string, any> }>;
-
-        // Prefer the active repository; fall back to the first repository that has content.
-        const sysCfg = await this.adapter.getForeignObjectAsync('system.config', { user: this.defaultUser });
-        const active = sysCfg?.common?.activeRepo;
-        const activeNames = Array.isArray(active) ? active : active ? [active] : [];
-
-        // Merge the JSON of ALL active repositories (or all repositories if none is marked active). An
-        // adapter present in several repos is kept once (first/active repo wins). This matters when the
-        // user has custom repos active next to the default one (their adapters are not in stable).
-        const activeWithJson = activeNames.filter(name => repositories[name]?.json);
-        const sources = (
-            activeWithJson.length ? activeWithJson.map(name => repositories[name]) : Object.values(repositories)
-        )
-            .map(repo => repo?.json)
-            .filter((j): j is Record<string, any> => !!j);
-        const json: Record<string, any> = {};
-        for (const src of sources) {
-            for (const key of Object.keys(src)) {
-                if (!(key in json)) {
-                    json[key] = src[key];
-                }
-            }
-        }
+        const json = await this.getRepositoryJson();
         if (!Object.keys(json).length) {
             return [];
         }
@@ -2937,15 +3527,7 @@ export default class McpServer {
         if (given.length !== 1) {
             throw new Error('Give exactly one of "source", "file_path" or "file_name" + "file_content"');
         }
-
-        const host = (params.host || this.adapter.host || '').replace(/^system\.host\./, '');
-        if (!host || /\s/.test(host)) {
-            throw new Error(`Invalid host "${host}"`);
-        }
-        const hostObj = await this.adapter.getForeignObjectAsync(`system.host.${host}`, { user: this.defaultUser });
-        if (hostObj?.type !== 'host') {
-            throw new Error(`Host "${host}" not found`);
-        }
+        const host = await this.resolveHost(params.host);
 
         let source: string;
         let files: { name: string; file: string }[] | undefined;
@@ -2988,12 +3570,53 @@ export default class McpServer {
             files = [{ name: source, file: data.toString('base64') }];
         }
 
-        const command = `url ${source} --host ${host}${params.debug ? ' --debug' : ''}`;
+        const result = await this.runHostCommand(
+            host,
+            `url ${source} --host ${host}${params.debug ? ' --debug' : ''}`,
+            params.timeout,
+            files,
+        );
+        const adapterName = extractAdapterName(params.file_path || params.file_name || params.source || '');
+        const restarted =
+            result.success && adapterName && params.restart_instances !== false
+                ? await this.restartAdapterInstances(adapterName)
+                : [];
+        return { ...result, adapter: adapterName, restartedInstances: restarted };
+    }
+
+    /** Normalize a host name (with or without `system.host.`) and check that the host exists. */
+    private async resolveHost(host?: string): Promise<string> {
+        const name = (host || this.adapter.host || '').replace(/^system\.host\./, '');
+        if (!name || /\s/.test(name)) {
+            throw new Error(`Invalid host "${name}"`);
+        }
+        const hostObj = await this.adapter.getForeignObjectAsync(`system.host.${name}`, { user: this.defaultUser });
+        if (hostObj?.type !== 'host') {
+            throw new Error(`Host "${name}" not found`);
+        }
+        return name;
+    }
+
+    /**
+     * Run an ioBroker CLI command on a host via `cmdExec` and wait for its exit code. The host reports
+     * the output and the exit code as messages to this instance, see {@link onMessage}.
+     *
+     * @param host host name without `system.host.`
+     * @param command the CLI arguments, e.g. `upgrade hue@3.9.0`
+     * @param timeoutSeconds how long to wait; the command keeps running on the host after that
+     * @param files files sent along with the command (the command refers to them by name)
+     */
+    private async runHostCommand(
+        host: string,
+        command: string,
+        timeoutSeconds?: number,
+        files?: { name: string; file: string }[],
+    ): Promise<Record<string, unknown> & { success?: boolean }> {
         const id = `mcp-${randomUUID()}`;
-        const timeout = (params.timeout ?? DEFAULT_INSTALL_TIMEOUT) * 1000;
+        const timeout = (timeoutSeconds ?? DEFAULT_INSTALL_TIMEOUT) * 1000;
         const output: string[] = [];
 
-        this.adapter.log.info(`[install_package] ${host}: iobroker ${command}`);
+        this.adapter.log.info(`[cmdExec] ${host}: iobroker ${command}`);
         const exitCode = await new Promise<number | null>(resolve => {
             const timer = setTimeout(() => {
                 this.cmdSessions.delete(id);
@@ -3009,34 +3632,517 @@ export default class McpServer {
             this.adapter.sendToHost(`system.host.${host}`, 'cmdExec', { data: command, id, files });
         });
 
-        const adapterName = extractAdapterName(params.file_path || params.file_name || params.source || '');
-        const restarted: string[] = [];
-        if (exitCode === 0 && adapterName && params.restart_instances !== false) {
-            // Like admin: touching the instance object makes the controller restart it with the new code
-            const instances = await this.adapter.getForeignObjectsAsync(`system.adapter.${adapterName}.*`, 'instance', {
-                user: this.defaultUser,
-            });
-            for (const [instanceId, instance] of Object.entries(instances || {})) {
-                if (instance?.common?.enabled) {
-                    await this.adapter.extendForeignObjectAsync(instanceId, {}, { user: this.defaultUser });
-                    restarted.push(instanceId.replace('system.adapter.', ''));
-                }
-            }
-        }
-
         return {
             host,
             command: `iobroker ${command}`,
-            adapter: adapterName,
             ...(exitCode === null
                 ? {
                       finished: false,
-                      note: `No result after ${timeout / 1000}s - the installation keeps running on the host, check the log`,
+                      note: `No result after ${timeout / 1000}s - the command keeps running on the host, check the log`,
                   }
                 : { finished: true, success: exitCode === 0, exitCode }),
-            restartedInstances: restarted,
             output,
         };
+    }
+
+    /** Request something from a host (`getNotifications`, ...) and wait for the answer. */
+    private hostRequest(host: string, command: string, message: unknown): Promise<any> {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`Host "${host}" did not answer "${command}"`)), 10_000);
+            this.adapter.sendToHost(`system.host.${host}`, command, message, (result: any) => {
+                clearTimeout(timer);
+                if (result?.error) {
+                    reject(new Error(result.error));
+                } else {
+                    resolve(result);
+                }
+            });
+        });
+    }
+
+    /** Like admin after an installation: touching the instance objects makes the controller restart them. */
+    private async restartAdapterInstances(adapterName: string): Promise<string[]> {
+        const instances = await this.adapter.getForeignObjectsAsync(`system.adapter.${adapterName}.*`, 'instance', {
+            user: this.defaultUser,
+        });
+        const restarted: string[] = [];
+        for (const [instanceId, instance] of Object.entries(instances || {})) {
+            if (instance?.common?.enabled) {
+                await this.adapter.extendForeignObjectAsync(instanceId, {}, { user: this.defaultUser });
+                restarted.push(instanceId.replace('system.adapter.', ''));
+            }
+        }
+        return restarted;
+    }
+
+    /** Read an instance object by its short id (`hue.0`) or full id (`system.adapter.hue.0`). */
+    private async getInstance(id: string): Promise<{ id: string; fullId: string; obj: ioBroker.InstanceObject }> {
+        const shortId = id.replace(/^system\.adapter\./, '');
+        if (!/^[a-z0-9][a-z0-9_-]*\.\d+$/i.test(shortId)) {
+            throw new Error(`Invalid instance "${id}", expected e.g. "hue.0"`);
+        }
+        const fullId = `system.adapter.${shortId}`;
+        const obj = await this.adapter.getForeignObjectAsync(fullId, { user: this.defaultUser });
+        if (obj?.type !== 'instance') {
+            throw new Error(`Instance "${shortId}" not found`);
+        }
+        return { id: shortId, fullId, obj: obj };
+    }
+
+    /** Start (enable) or stop (disable) an instance. */
+    private async setInstanceEnabled(id: string, enabled: boolean): Promise<Record<string, unknown>> {
+        const instance = await this.getInstance(id);
+        const changed = !!instance.obj.common.enabled !== enabled;
+        if (changed) {
+            await this.adapter.extendForeignObjectAsync(
+                instance.fullId,
+                { common: { enabled } },
+                { user: this.defaultUser },
+            );
+        }
+        return { id: instance.id, enabled, changed };
+    }
+
+    /** Restart a running instance. */
+    private async restartInstance(id: string): Promise<Record<string, unknown>> {
+        const instance = await this.getInstance(id);
+        if (!instance.obj.common.enabled) {
+            throw new Error(`Instance "${instance.id}" is not enabled - start it instead`);
+        }
+        await this.adapter.extendForeignObjectAsync(instance.fullId, {}, { user: this.defaultUser });
+        return { id: instance.id, restarted: true };
+    }
+
+    /**
+     * Change the log level of an instance: temporarily via its `logLevel` state (no restart, until the
+     * next start), or persistently in the instance object (restarts the instance).
+     */
+    private async setLogLevel(
+        id: string,
+        level: ioBroker.LogLevel,
+        persistent?: boolean,
+    ): Promise<Record<string, unknown>> {
+        const instance = await this.getInstance(id);
+        if (persistent) {
+            await this.adapter.extendForeignObjectAsync(
+                instance.fullId,
+                { common: { loglevel: level } },
+                { user: this.defaultUser },
+            );
+        } else {
+            await this.adapter.setForeignStateAsync(`${instance.fullId}.logLevel`, level, false, {
+                user: this.defaultUser,
+            });
+        }
+        return { id: instance.id, level, persistent: !!persistent };
+    }
+
+    /** Check an adapter name, as the CLI receives it as an argument. */
+    private static checkAdapterName(name: string): string {
+        const adapterName = name
+            .trim()
+            .replace(/^iobroker\./i, '')
+            .toLowerCase();
+        if (!/^[a-z0-9][a-z0-9_-]*$/.test(adapterName)) {
+            throw new Error(`Invalid adapter name "${name}"`);
+        }
+        return adapterName;
+    }
+
+    /** Create an instance of an adapter (installs the adapter from the repository if necessary). */
+    private async addInstance(params: {
+        adapter: string;
+        instance?: number;
+        host?: string;
+        timeout?: number;
+    }): Promise<Record<string, unknown>> {
+        const adapterName = McpServer.checkAdapterName(params.adapter);
+        const host = await this.resolveHost(params.host);
+        if (params.instance !== undefined) {
+            const existing = await this.adapter.getForeignObjectAsync(
+                `system.adapter.${adapterName}.${params.instance}`,
+                { user: this.defaultUser },
+            );
+            if (existing) {
+                throw new Error(`Instance "${adapterName}.${params.instance}" already exists`);
+            }
+        }
+        return this.runHostCommand(
+            host,
+            `add ${adapterName}${params.instance !== undefined ? ` ${params.instance}` : ''} --host ${host}`,
+            params.timeout,
+        );
+    }
+
+    /** Delete an instance with its objects and states (on the host it runs on). */
+    private async deleteInstance(params: { id: string; timeout?: number }): Promise<Record<string, unknown>> {
+        const instance = await this.getInstance(params.id);
+        const host = await this.resolveHost(instance.obj.common.host);
+        return this.runHostCommand(host, `del ${instance.id}`, params.timeout);
+    }
+
+    /** Upgrade an installed adapter to the repository version (or the given one). */
+    private async upgradeAdapter(params: {
+        adapter: string;
+        version?: string;
+        host?: string;
+        timeout?: number;
+    }): Promise<Record<string, unknown>> {
+        const adapterName = McpServer.checkAdapterName(params.adapter);
+        if (params.version !== undefined && !/^\d+\.\d+\.\d+[\w.+-]*$/.test(params.version)) {
+            throw new Error(`Invalid version "${params.version}"`);
+        }
+        const adapterObj = await this.adapter.getForeignObjectAsync(`system.adapter.${adapterName}`, {
+            user: this.defaultUser,
+        });
+        if (adapterObj?.type !== 'adapter') {
+            throw new Error(`Adapter "${adapterName}" is not installed - use add_instance to install it`);
+        }
+        const version = params.version || (await this.getRepositoryJson())[adapterName]?.version;
+        if (!version) {
+            throw new Error(`Adapter "${adapterName}" is not in the active repository, give a version`);
+        }
+        const host = await this.resolveHost(params.host);
+        return this.runHostCommand(host, `upgrade ${adapterName}@${version}`, params.timeout);
+    }
+
+    /** List the installed adapters that have a newer version in the active repository. */
+    private async listAdapterUpdates(): Promise<Record<string, unknown>[]> {
+        const repo = await this.getRepositoryJson();
+        const result: Record<string, unknown>[] = [];
+        for (const adapter of await this.listAdapters()) {
+            const name = adapter.name as string;
+            const available = repo[name]?.version as string | undefined;
+            if (available && compareVersions(available, adapter.version as string) > 0) {
+                result.push({ name, installed: adapter.version, available, title: adapter.title });
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Read the JSON of the active repositories from `system.repositories` (or of all repositories if none
+     * is marked active). An adapter present in several repos is kept once (first/active repo wins). This
+     * matters when the user has custom repos active next to the default one.
+     */
+    private async getRepositoryJson(): Promise<Record<string, any>> {
+        const reposObj = await this.adapter.getForeignObjectAsync('system.repositories', { user: this.defaultUser });
+        const repositories = (reposObj?.native?.repositories || {}) as Record<string, { json?: Record<string, any> }>;
+
+        const sysCfg = await this.adapter.getForeignObjectAsync('system.config', { user: this.defaultUser });
+        const active = sysCfg?.common?.activeRepo;
+        const activeNames = Array.isArray(active) ? active : active ? [active] : [];
+
+        const activeWithJson = activeNames.filter(name => repositories[name]?.json);
+        const sources = (
+            activeWithJson.length ? activeWithJson.map(name => repositories[name]) : Object.values(repositories)
+        )
+            .map(repo => repo?.json)
+            .filter((j): j is Record<string, any> => !!j);
+        const json: Record<string, any> = {};
+        for (const src of sources) {
+            for (const key of Object.keys(src)) {
+                if (!(key in json)) {
+                    json[key] = src[key];
+                }
+            }
+        }
+        return json;
+    }
+
+    /** Read the current notifications of one or all hosts, one entry per category and instance. */
+    private async listNotifications(params: {
+        host?: string;
+        language?: ioBroker.Languages;
+    }): Promise<Record<string, unknown>[]> {
+        const lang = params.language || this.language;
+        const hosts = params.host
+            ? [await this.resolveHost(params.host)]
+            : (await this.listHosts()).filter(host => host.alive).map(host => host.id as string);
+
+        const result: Record<string, unknown>[] = [];
+        for (const host of hosts) {
+            const answer = await this.hostRequest(host, 'getNotifications', {});
+            const scopes = (answer?.result || {}) as Record<string, any>;
+            for (const [scope, scopeObj] of Object.entries(scopes)) {
+                const categories = (scopeObj?.categories || {}) as Record<string, any>;
+                for (const [category, categoryObj] of Object.entries(categories)) {
+                    const instances = (categoryObj?.instances || {}) as Record<string, any>;
+                    for (const [instance, instanceObj] of Object.entries(instances)) {
+                        const messages = (instanceObj?.messages || []) as { message: string; ts: number }[];
+                        if (!messages.length) {
+                            continue;
+                        }
+                        result.push({
+                            host,
+                            scope,
+                            category,
+                            instance: instance.replace(/^system\.adapter\./, ''),
+                            severity: categoryObj.severity,
+                            name: getText(categoryObj.name, lang),
+                            description: getText(categoryObj.description, lang),
+                            messages: messages.map(one => ({ message: one.message, ts: one.ts })),
+                        });
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /** Acknowledge (delete) notifications on a host, optionally only of one scope/category/instance. */
+    private async clearNotifications(params: {
+        host?: string;
+        scope?: string;
+        category?: string;
+        instance?: string;
+    }): Promise<Record<string, unknown>> {
+        const host = await this.resolveHost(params.host);
+        const instance = params.instance ? `system.adapter.${params.instance.replace(/^system\.adapter\./, '')}` : null;
+        await this.hostRequest(host, 'clearNotifications', {
+            scope: params.scope || null,
+            category: params.category || null,
+            instance,
+        });
+        return { host, cleared: true };
+    }
+
+    /**
+     * Normalize a script id: `script.js.common.lights`, `common.lights` or `lights` (folder `common`).
+     * Every segment is reduced to the characters the javascript editor uses for ids.
+     */
+    private static scriptId(id: string): string {
+        let path = id.trim().replace(/^script\.js\./, '');
+        if (!path.includes('.')) {
+            path = `common.${path}`;
+        }
+        const segments = path.split('.').map(segment => segment.trim().replace(/[^\p{L}\p{N}_-]/gu, '_'));
+        if (segments.some(segment => !segment)) {
+            throw new Error(`Invalid script id "${id}"`);
+        }
+        return `script.js.${segments.join('.')}`;
+    }
+
+    /** Summary of a script object, optionally with its source. */
+    private scriptInfo(id: string, obj: ioBroker.Object, withSource?: boolean): Record<string, unknown> {
+        const common = (obj.common || {}) as Partial<ioBroker.ScriptCommon>;
+        return {
+            id,
+            name: this.getName(common.name),
+            engineType: common.engineType || 'Javascript/js',
+            enabled: !!common.enabled,
+            engine: (common.engine || '').replace(/^system\.adapter\./, ''),
+            ...(withSource ? { source: common.source || '' } : {}),
+        };
+    }
+
+    /** Read a script object, failing if it is missing or not a script. */
+    private async getScriptObject(id: string): Promise<{ id: string; obj: ioBroker.Object }> {
+        const scriptId = McpServer.scriptId(id);
+        const obj = await this.adapter.getForeignObjectAsync(scriptId, { user: this.defaultUser });
+        if (obj?.type !== 'script') {
+            throw new Error(`Script "${scriptId}" not found`);
+        }
+        return { id: scriptId, obj };
+    }
+
+    /** List the scripts of the javascript adapter (without their source). */
+    private async listScripts(folder?: string): Promise<Record<string, unknown>[]> {
+        const prefix = folder ? `script.js.${folder.replace(/^script\.js\./, '').replace(/\.$/, '')}.` : 'script.js.';
+        const objs = await this.adapter.getForeignObjectsAsync(`${prefix}*`, 'script', { user: this.defaultUser });
+        return Object.entries(objs || {}).map(([id, obj]) => this.scriptInfo(id, obj));
+    }
+
+    /**
+     * Create a script or change the source of an existing one. Blockly and Rules scripts keep their
+     * blocks in the source, so they are not changed. New scripts start disabled unless `enabled` is given.
+     */
+    private async setScript(params: {
+        id: string;
+        source: string;
+        engineType?: 'Javascript/js' | 'TypeScript/ts';
+        name?: string;
+        enabled?: boolean;
+        instance?: string;
+    }): Promise<Record<string, unknown>> {
+        const scriptId = McpServer.scriptId(params.id);
+        const existing = await this.adapter.getForeignObjectAsync(scriptId, { user: this.defaultUser });
+        if (existing && existing.type !== 'script') {
+            throw new Error(`"${scriptId}" exists and is not a script`);
+        }
+        if (existing) {
+            const engineType = (existing.common as Partial<ioBroker.ScriptCommon>).engineType || 'Javascript/js';
+            if (!/^(javascript|typescript)/i.test(engineType)) {
+                throw new Error(`"${scriptId}" is a ${engineType} script; only JavaScript/TypeScript can be changed`);
+            }
+            const common: Partial<ioBroker.ScriptCommon> = { source: params.source };
+            if (params.name !== undefined) {
+                common.name = params.name;
+            }
+            if (params.enabled !== undefined) {
+                common.enabled = params.enabled;
+            }
+            await this.adapter.extendForeignObjectAsync(scriptId, { common }, { user: this.defaultUser });
+            return { id: scriptId, created: false };
+        }
+
+        const engine = (await this.getInstance(params.instance || 'javascript.0')).id;
+        // The parent folders are channels, like the javascript editor creates them
+        const segments = scriptId.split('.');
+        for (let i = 3; i < segments.length; i++) {
+            const folderId = segments.slice(0, i).join('.');
+            if (!(await this.adapter.getForeignObjectAsync(folderId, { user: this.defaultUser }))) {
+                await this.adapter.setForeignObjectAsync(
+                    folderId,
+                    { type: 'channel', common: { name: segments[i - 1] }, native: {} },
+                    { user: this.defaultUser },
+                );
+            }
+        }
+        await this.adapter.setForeignObjectAsync(
+            scriptId,
+            {
+                type: 'script',
+                common: {
+                    name: params.name || segments[segments.length - 1],
+                    expert: true,
+                    engineType: params.engineType || 'Javascript/js',
+                    enabled: !!params.enabled,
+                    engine: `system.adapter.${engine}`,
+                    source: params.source,
+                    debug: false,
+                    verbose: false,
+                },
+                native: {},
+            } as unknown as ioBroker.ScriptObject,
+            { user: this.defaultUser },
+        );
+        return { id: scriptId, created: true };
+    }
+
+    /** Enable (start) or disable (stop) a script. */
+    private async enableScript(id: string, enabled: boolean): Promise<Record<string, unknown>> {
+        const script = await this.getScriptObject(id);
+        await this.adapter.extendForeignObjectAsync(script.id, { common: { enabled } }, { user: this.defaultUser });
+        return { id: script.id, enabled };
+    }
+
+    /** Delete a script. */
+    private async deleteScript(id: string): Promise<Record<string, unknown>> {
+        const script = await this.getScriptObject(id);
+        await this.adapter.delForeignObjectAsync(script.id, { user: this.defaultUser });
+        return { id: script.id, deleted: true };
+    }
+
+    /**
+     * Run code once in the javascript adapter (its `execute` message) and return what it logged. Nothing
+     * is stored; timers and subscriptions are cleaned up after `timeout`.
+     */
+    private async runScript(params: {
+        source: string;
+        engineType?: 'Javascript/js' | 'TypeScript/ts';
+        timeout?: number;
+        instance?: string;
+    }): Promise<Record<string, unknown>> {
+        const instance = await this.getInstance(params.instance || 'javascript.0');
+        const timeout = params.timeout ?? 5000;
+        const result = await this.adapter.sendToAsync(
+            instance.id,
+            'execute',
+            { source: params.source, engineType: params.engineType, timeout, verbose: false, logLevel: 'info' },
+            { timeout: timeout + 15_000, user: this.defaultUser },
+        );
+        if (!result || typeof result !== 'object') {
+            throw new Error(`"${instance.id}" did not answer - javascript adapter 10.1.0 or newer is required`);
+        }
+        return result as Record<string, unknown>;
+    }
+
+    /** Whether `send_to` may address this instance (by adapter name, instance or `*`). */
+    private isSendToAllowed(instance: string): boolean {
+        const allowed = (this.config.sendToAllowlist || '')
+            .split(/[\s,;]+/)
+            .map(one => one.replace(/^system\.adapter\./, ''))
+            .filter(Boolean);
+        return allowed.includes('*') || allowed.includes(instance) || allowed.includes(instance.split('.')[0]);
+    }
+
+    /** Send a message to an adapter instance (`sendTo`) and return its answer. */
+    private async sendToInstance(params: {
+        instance: string;
+        command: string;
+        message?: unknown;
+        timeout?: number;
+    }): Promise<Record<string, unknown>> {
+        const instance = await this.getInstance(params.instance);
+        if (!this.isSendToAllowed(instance.id)) {
+            throw new Error(`"${instance.id}" is not in the allowlist of send_to`);
+        }
+        const response = await this.adapter.sendToAsync(
+            instance.id,
+            params.command,
+            (params.message ?? {}) as ioBroker.MessagePayload,
+            { timeout: params.timeout ?? 10_000, user: this.defaultUser },
+        );
+        return { instance: instance.id, command: params.command, response: response ?? null };
+    }
+
+    /**
+     * Create an alias (`alias.0.*`) that points to another state. Type, role, unit and limits are copied
+     * from the target unless given.
+     */
+    private async createAlias(params: {
+        id: string;
+        target: string;
+        write_target?: string;
+        name?: string;
+        role?: string;
+        unit?: string;
+    }): Promise<Record<string, unknown>> {
+        const id = params.id.startsWith('alias.') ? params.id : `alias.0.${params.id}`;
+        if (!/^alias\.\d+\.[^*\s]+$/.test(id)) {
+            throw new Error(`Invalid alias id "${params.id}"`);
+        }
+        if (await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser })) {
+            throw new Error(`Object "${id}" already exists`);
+        }
+        const target = await this.adapter.getForeignObjectAsync(params.target, { user: this.defaultUser });
+        if (target?.type !== 'state') {
+            throw new Error(`Target "${params.target}" is not a state`);
+        }
+        if (params.write_target) {
+            const writeTarget = await this.adapter.getForeignObjectAsync(params.write_target, {
+                user: this.defaultUser,
+            });
+            if (writeTarget?.type !== 'state') {
+                throw new Error(`Write target "${params.write_target}" is not a state`);
+            }
+        }
+        const source = target.common as ioBroker.StateCommon;
+        const common: Record<string, unknown> = {
+            name: params.name || source.name || id.split('.').pop(),
+            type: source.type || 'mixed',
+            role: params.role || source.role || 'state',
+            read: source.read !== false,
+            write: params.write_target ? true : source.write !== false,
+            alias: {
+                id: params.write_target ? { read: params.target, write: params.write_target } : params.target,
+            },
+        };
+        for (const key of ['min', 'max', 'step', 'states'] as const) {
+            if (source[key] !== undefined) {
+                common[key] = source[key];
+            }
+        }
+        if (params.unit !== undefined || source.unit !== undefined) {
+            common.unit = params.unit ?? source.unit;
+        }
+        await this.adapter.setForeignObjectAsync(
+            id,
+            { type: 'state', common, native: {} } as unknown as ioBroker.StateObject,
+            { user: this.defaultUser },
+        );
+        return { id, target: params.target, ...(params.write_target ? { write_target: params.write_target } : {}) };
     }
 
     // --- helpers ---
