@@ -285,7 +285,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.4.0 (2026-10-23)
 * (@GermanBluefox) Added tools to control instances, manage adapters, read/change/run scripts, read and acknowledge notifications, create aliases and send messages to adapters, each behind its own option (off by default)
 * (@GermanBluefox) Added the prompts `diagnose_adapter`, `room_overview` and `create_automation`
 * (@GermanBluefox) Dangerous actions ask the user for a confirmation if the client supports elicitation (option `confirmDangerous`)
