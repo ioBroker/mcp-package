@@ -73,6 +73,11 @@ export interface InProcessMcpOptions {
     setStateDestructive?: boolean;
     /** Allow the object/file-changing tools (`create_state`, `set_object`, ...) (default: false). */
     allowObjectChange?: boolean;
+    /**
+     * Allow the `install_package` tool, which installs adapter packages on a host (default: false).
+     * Only relevant for adapter developers.
+     */
+    allowPackageInstall?: boolean;
     /** Name reported to the server by the embedded client. */
     clientName?: string;
     /** Version reported to the server by the embedded client. */
@@ -109,6 +114,7 @@ export async function createInProcessMcp(options: InProcessMcpOptions): Promise<
         allowSetState: options.allowSetState,
         allowObjectChange: options.allowObjectChange,
         setStateDestructive: options.setStateDestructive,
+        allowPackageInstall: options.allowPackageInstall,
     });
 
     const server = mcp.createInProcessServer();

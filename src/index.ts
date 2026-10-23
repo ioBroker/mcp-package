@@ -145,6 +145,40 @@ const LOG_BUFFER_SIZE = 200;
  * JSON string (escaping) or base64 (+33%), so 512 KiB of raw data keeps the wrapped result safely below that cap.
  */
 const DEFAULT_MAX_READ_BYTES = 512 * 1024;
+/** Default time `install_package` waits for the installation to finish (seconds). */
+const DEFAULT_INSTALL_TIMEOUT = 300;
+/** How many output lines of an installation are returned to the client. */
+const INSTALL_OUTPUT_LINES = 100;
+
+/** A running `cmdExec` on a host, started by `install_package`. */
+interface CmdSession {
+    /** Collected stdout/stderr lines, in the order they arrived */
+    output: string[];
+    /** Called with the exit code once the host reports `cmdExit` */
+    onExit: (exitCode: number) => void;
+}
+
+/**
+ * Extract the adapter name from an install source, like `iobroker.admin-7.8.6.tgz`,
+ * `ioBroker/ioBroker.admin#main`, `iobroker.admin@7.8.6` or `admin`. Same rules as in ioBroker.admin.
+ */
+function extractAdapterName(source: string): string | null {
+    // cut off the query string and the anchor, like in `.../ioBroker.xyz/tarball/main?token=1`
+    const url = source.trim().split('?')[0].split('#')[0];
+
+    const packed = url.match(/iobroker\.([a-z\d][a-z\d_-]*?)-\d+\.\d+\.\d+[^/\\]*\.tgz$/i);
+    if (packed) {
+        return packed[1].toLowerCase();
+    }
+    const named = url.match(/iobroker\.([a-z\d][a-z\d_-]*)/i);
+    if (named) {
+        return named[1].toLowerCase();
+    }
+    if (/^[a-z\d][a-z\d_-]*$/i.test(url)) {
+        return url.toLowerCase();
+    }
+    return null;
+}
 
 export default class McpServer {
     private readonly adapter: ioBroker.Adapter;
@@ -181,6 +215,8 @@ export default class McpServer {
     private readonly oauthResource: boolean;
     /** OAuth2 login/token server, created only when {@link authRequired} is true. */
     private oauth2?: OAuth2Model;
+    /** Installations started by `install_package`, keyed by the `cmdExec` session id. */
+    private readonly cmdSessions = new Map<string, CmdSession>();
 
     constructor(
         server: HttpServer | HttpsServer | null,
@@ -199,6 +235,8 @@ export default class McpServer {
             setStateDestructive?: boolean;
             /** Explicit override for the object/file-changing tool permission (embedded mode). */
             allowObjectChange?: boolean;
+            /** Explicit override for the package installation permission (embedded mode). */
+            allowPackageInstall?: boolean;
         },
         adapter: ioBroker.Adapter,
         instanceSettings: ioBroker.InstanceObject | null,
@@ -234,9 +272,14 @@ export default class McpServer {
         if (webSettings.setStateDestructive !== undefined) {
             this.config.setStateDestructive = webSettings.setStateDestructive;
         }
-        // Permission toggles: state writes are allowed by default, object/file changes are not.
+        if (webSettings.allowPackageInstall !== undefined) {
+            this.config.allowPackageInstall = webSettings.allowPackageInstall;
+        }
+        // Permission toggles: state writes are allowed by default, object/file changes and
+        // package installation are not.
         this.config.allowSetState = this.config.allowSetState !== false;
         this.config.allowObjectChange = this.config.allowObjectChange === true;
+        this.config.allowPackageInstall = this.config.allowPackageInstall === true;
         // State writes are declared destructive unless turned off explicitly
         this.config.setStateDestructive = this.config.setStateDestructive !== false;
 
@@ -266,6 +309,10 @@ export default class McpServer {
 
         // Receive ioBroker log messages (only forwarded once a session subscribes via requireLog).
         this.adapter.on('log', this.onLog);
+        if (this.config.allowPackageInstall) {
+            // The host reports the progress of `cmdExec` (install_package) as messages to this instance
+            this.adapter.on('message', this.onMessage);
+        }
 
         // Wire HTTP routes only when we own/share an Express app. In embedded in-process mode (no app)
         // the server is reached over an in-memory transport instead, see createInProcessServer().
@@ -294,6 +341,7 @@ export default class McpServer {
      * @param options.allowSetState Allow the state-writing tools `set_state`/`set_states` (opt-out, default true)
      * @param options.allowObjectChange Allow the object/file-changing tools (opt-in, default false)
      * @param options.setStateDestructive Declare `set_state`/`set_states` as destructive (default true)
+     * @param options.allowPackageInstall Allow the `install_package` tool (opt-in, default false, developers only)
      */
     static createEmbedded(options: {
         adapter: ioBroker.Adapter;
@@ -302,6 +350,7 @@ export default class McpServer {
         allowSetState?: boolean;
         allowObjectChange?: boolean;
         setStateDestructive?: boolean;
+        allowPackageInstall?: boolean;
     }): McpServer {
         return new McpServer(
             null,
@@ -313,6 +362,7 @@ export default class McpServer {
                 allowSetState: options.allowSetState,
                 allowObjectChange: options.allowObjectChange,
                 setStateDestructive: options.setStateDestructive,
+                allowPackageInstall: options.allowPackageInstall,
             },
             options.adapter,
             null,
@@ -755,6 +805,25 @@ export default class McpServer {
                     });
                 }
             }
+        }
+    };
+
+    /** Receive the progress of a `cmdExec` started by `install_package` (`cmdStdout`/`cmdStderr`/`cmdExit`). */
+    private onMessage = (msg: ioBroker.Message): void => {
+        const id = msg?.message?.id;
+        const session = typeof id === 'string' ? this.cmdSessions.get(id) : undefined;
+        if (!session) {
+            // not ours, e.g. a cmdExec of admin or the second (repeated) cmdExit
+            return;
+        }
+        if (msg.command === 'cmdStdout' || msg.command === 'cmdStderr') {
+            session.output.push(String(msg.message.data ?? ''));
+            if (session.output.length > INSTALL_OUTPUT_LINES) {
+                session.output.splice(0, session.output.length - INSTALL_OUTPUT_LINES);
+            }
+        } else if (msg.command === 'cmdExit') {
+            this.cmdSessions.delete(id);
+            session.onExit(typeof msg.message.data === 'number' ? msg.message.data : -1);
         }
     };
 
@@ -1613,6 +1682,68 @@ export default class McpServer {
                         }
                         await this.adapter.mkdirAsync(adapterName, dirName, { user: this.defaultUser });
                         return ok({ ok: true, data: { path } });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+        }
+
+        // Installing packages runs arbitrary code on the host, so it is a separate opt-in for developers.
+        if (this.config.allowPackageInstall) {
+            server.registerTool(
+                'install_package',
+                {
+                    title: 'Install an adapter package',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: false,
+                        openWorldHint: true,
+                    },
+                    description:
+                        'Developer tool: install an ioBroker adapter package on a host, like "Install from custom ' +
+                        'URL" / "file" in ioBroker.admin (`iobroker url`). Give exactly one of: `source` - an npm ' +
+                        'package ("iobroker.hue@3.9.0" or just "hue"), a GitHub repository ' +
+                        '("ioBroker/ioBroker.hue#main" or https URL), an https URL of a .tgz or a .tgz path on the ' +
+                        'target host; `file_path` - a .tgz in the ioBroker file storage ("0_userdata.0/x.tgz"); or ' +
+                        '`file_name` + `file_content` - a small .tgz as base64. Waits until the installation is ' +
+                        'finished (or `timeout`), returns the exit code and the last output lines. Enabled instances ' +
+                        'of the adapter are restarted afterwards; no new instance is created.',
+                    inputSchema: {
+                        source: z
+                            .string()
+                            .optional()
+                            .describe('npm package, GitHub repository, https URL or path of a .tgz on the host'),
+                        file_path: z
+                            .string()
+                            .optional()
+                            .describe('.tgz in the ioBroker file storage as "<adapter>/<dir>/<file>.tgz"'),
+                        file_name: z
+                            .string()
+                            .optional()
+                            .describe('File name of the .tgz in file_content, e.g. "iobroker.hue-3.9.0.tgz"'),
+                        file_content: z.string().optional().describe('The .tgz file as base64'),
+                        host: z.string().optional().describe('Target host (default: the host of this instance)'),
+                        debug: z.boolean().optional().describe('Install with --debug for more output'),
+                        restart_instances: z
+                            .boolean()
+                            .optional()
+                            .describe('Restart enabled instances of the adapter after installing (default true)'),
+                        timeout: z
+                            .number()
+                            .int()
+                            .min(1)
+                            .max(3600)
+                            .optional()
+                            .describe(
+                                `Seconds to wait for the installation (default ${DEFAULT_INSTALL_TIMEOUT}); it keeps running on the host after that`,
+                            ),
+                    },
+                },
+                async args => {
+                    try {
+                        return ok({ ok: true, data: await this.installPackage(args) });
                     } catch (e) {
                         return fail(e);
                     }
@@ -2788,6 +2919,126 @@ export default class McpServer {
         return { id, members: params.members.length };
     }
 
+    /**
+     * Install an adapter package on a host via `cmdExec` (`iobroker url ...`), the same way
+     * ioBroker.admin installs from a custom URL or a .tgz file, and wait for the result.
+     */
+    private async installPackage(params: {
+        source?: string;
+        file_path?: string;
+        file_name?: string;
+        file_content?: string;
+        host?: string;
+        debug?: boolean;
+        restart_instances?: boolean;
+        timeout?: number;
+    }): Promise<Record<string, unknown>> {
+        const given = [params.source, params.file_path, params.file_content].filter(one => one !== undefined);
+        if (given.length !== 1) {
+            throw new Error('Give exactly one of "source", "file_path" or "file_name" + "file_content"');
+        }
+
+        const host = (params.host || this.adapter.host || '').replace(/^system\.host\./, '');
+        if (!host || /\s/.test(host)) {
+            throw new Error(`Invalid host "${host}"`);
+        }
+        const hostObj = await this.adapter.getForeignObjectAsync(`system.host.${host}`, { user: this.defaultUser });
+        if (hostObj?.type !== 'host') {
+            throw new Error(`Host "${host}" not found`);
+        }
+
+        let source: string;
+        let files: { name: string; file: string }[] | undefined;
+        if (params.source !== undefined) {
+            source = params.source.trim();
+            // The host splits the command at spaces, so a source must be one argument and no option
+            if (!source || /\s/.test(source) || source.startsWith('-')) {
+                throw new Error(`Invalid source "${params.source}"`);
+            }
+            // a pure adapter name, like in the "Custom URL" tab of admin
+            if (!/[./:]/.test(source)) {
+                source = `iobroker.${source}`;
+            }
+        } else {
+            let fileName: string;
+            let data: Buffer;
+            if (params.file_path !== undefined) {
+                const { adapterName, fileName: storageName } = McpServer.parseFilePath(params.file_path);
+                const result = await this.adapter.readFileAsync(adapterName, storageName, { user: this.defaultUser });
+                data = Buffer.isBuffer(result.file) ? result.file : Buffer.from(result.file || '');
+                fileName = storageName.split('/').pop() || '';
+            } else {
+                if (!params.file_name) {
+                    throw new Error('"file_content" requires "file_name"');
+                }
+                data = Buffer.from(params.file_content!, 'base64');
+                fileName = params.file_name;
+            }
+            if (!fileName.toLowerCase().endsWith('.tgz')) {
+                throw new Error('Only .tgz files can be installed');
+            }
+            if (!data.length) {
+                throw new Error('The .tgz file is empty');
+            }
+            if (!this.adapter.supportsFeature?.('CONTROLLER_CMD_EXEC_FILES')) {
+                throw new Error('Installing a .tgz file requires a js-controller that supports files in cmdExec');
+            }
+            // The command refers to the file by name, so it must not contain spaces, "/" or "\"
+            source = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+            files = [{ name: source, file: data.toString('base64') }];
+        }
+
+        const command = `url ${source} --host ${host}${params.debug ? ' --debug' : ''}`;
+        const id = `mcp-${randomUUID()}`;
+        const timeout = (params.timeout ?? DEFAULT_INSTALL_TIMEOUT) * 1000;
+        const output: string[] = [];
+
+        this.adapter.log.info(`[install_package] ${host}: iobroker ${command}`);
+        const exitCode = await new Promise<number | null>(resolve => {
+            const timer = setTimeout(() => {
+                this.cmdSessions.delete(id);
+                resolve(null);
+            }, timeout);
+            this.cmdSessions.set(id, {
+                output,
+                onExit: code => {
+                    clearTimeout(timer);
+                    resolve(code);
+                },
+            });
+            this.adapter.sendToHost(`system.host.${host}`, 'cmdExec', { data: command, id, files });
+        });
+
+        const adapterName = extractAdapterName(params.file_path || params.file_name || params.source || '');
+        const restarted: string[] = [];
+        if (exitCode === 0 && adapterName && params.restart_instances !== false) {
+            // Like admin: touching the instance object makes the controller restart it with the new code
+            const instances = await this.adapter.getForeignObjectsAsync(`system.adapter.${adapterName}.*`, 'instance', {
+                user: this.defaultUser,
+            });
+            for (const [instanceId, instance] of Object.entries(instances || {})) {
+                if (instance?.common?.enabled) {
+                    await this.adapter.extendForeignObjectAsync(instanceId, {}, { user: this.defaultUser });
+                    restarted.push(instanceId.replace('system.adapter.', ''));
+                }
+            }
+        }
+
+        return {
+            host,
+            command: `iobroker ${command}`,
+            adapter: adapterName,
+            ...(exitCode === null
+                ? {
+                      finished: false,
+                      note: `No result after ${timeout / 1000}s - the installation keeps running on the host, check the log`,
+                  }
+                : { finished: true, success: exitCode === 0, exitCode }),
+            restartedInstances: restarted,
+            output,
+        };
+    }
+
     // --- helpers ---
 
     /** Resolve the member ids of a room/function enum matched by id or (localized) name. */
@@ -2827,6 +3078,7 @@ export default class McpServer {
     unload(): void {
         try {
             this.adapter.removeListener('log', this.onLog);
+            this.adapter.removeListener('message', this.onMessage);
         } catch {
             // ignore
         }

@@ -15,6 +15,7 @@ async function startMcp(options = {}) {
         language: 'en',
         allowSetState: true,
         allowObjectChange: true,
+        allowPackageInstall: true,
         clientName: 'mcp-test-client',
         ...options,
     });
@@ -23,7 +24,7 @@ async function startMcp(options = {}) {
 
 /**
  * Start an in-process MCP server without passing any permission option, so the documented defaults
- * apply: state writing is opt-out (on), object/file changing is opt-in (off).
+ * apply: state writing is opt-out (on), object/file changing and package installation are opt-in (off).
  *
  * @returns the connection plus the mock's in-memory stores
  */

@@ -29,6 +29,11 @@ export interface McpConfig {
     setStateDestructive?: boolean;
     /** Allow the object/file changing tools (`set_object`, `delete_object`, `create_state`, `create_scene`, `write_file`, `delete_file`, `rename_file`, `mkdir`) (default: false). */
     allowObjectChange: boolean;
+    /**
+     * Allow the `install_package` tool, which installs an adapter package (npm, GitHub, URL or `.tgz`)
+     * on an ioBroker host (default: false). Only relevant for adapter developers.
+     */
+    allowPackageInstall?: boolean;
     certPublic: string;
     certPrivate: string;
     certChained: string;

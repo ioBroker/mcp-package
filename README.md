@@ -119,6 +119,12 @@ the ACLs the MCP client should have.
 - **Allow object/file changes**: Allow MCP clients to create/modify/delete objects and files (the `set_object`,
   `delete_object`, `create_state`, `create_scene`, `write_file`, `delete_file`, `rename_file` and `mkdir`
   tools). Default: **off**. When off, these tools are not exposed at all.
+- **Allow installing packages (developers only)** (`allowPackageInstall`): Offer the `install_package` tool, which
+  installs an adapter package on an ioBroker host - from npm, GitHub, a URL or a `.tgz` file - exactly like
+  *Install from custom URL / file* in ioBroker.admin (`iobroker url ...`). Default: **off**. This option is only
+  relevant for adapter developers, e.g. to let an AI agent build an adapter, pack it with `npm pack` and install the
+  `.tgz` on a test system. An installed package runs with full rights on the host, so never enable it on a
+  productive system or for clients you do not fully trust.
 
 ### SSL/TLS Configuration
 - **Enable HTTPS**: Enable HTTPS/SSL for secure connections
@@ -168,6 +174,7 @@ Point your MCP client at:
 | `delete_file`               | Delete a file from an adapter file storage — requires *Allow object/file changes*                                                                                                                                                                    |
 | `rename_file`               | Rename/move a file within the same adapter file storage — requires *Allow object/file changes*                                                                                                                                                       |
 | `mkdir`                     | Create a directory in an adapter file storage — requires *Allow object/file changes*                                                                                                                                                                 |
+| `install_package`           | Install an adapter package (npm, GitHub, URL, `.tgz` from the file storage or as base64) on a host and restart its enabled instances — requires *Allow installing packages*, developers only                                                         |
 
 All object/state access runs with the permissions of the configured **Default User**. The write tools are only
 registered when their respective permission option is enabled.
@@ -226,6 +233,9 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Added the `install_package` tool (opt-in `allowPackageInstall`, only for developers): installs an adapter package from npm, GitHub, a URL or a `.tgz` file on a host
+
 ### 1.2.3 (2026-10-19)
 * (@GermanBluefox) updated packages
 

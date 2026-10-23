@@ -170,6 +170,13 @@ function createMockAdapter() {
         '2026-06-12 11:46:42.000  - debug: hue.0 (1235) Polling',
         4096,
     ];
+    /**
+     * `cmdExec` messages sent to a host (`install_package`), and how the simulated host answers:
+     * with `exitCode`, or not at all when `reply` is false.
+     */
+    const cmdExec = { sent: [], exitCode: 0, reply: true };
+    /** Ids of the objects touched via `extendForeignObjectAsync` (instance restarts). */
+    const extended = [];
     const listeners = {};
     const subscriptions = { states: [], objects: [], log: [] };
     /** Merged group permissions per user, as returned by `calculatePermissionsAsync`. */
@@ -263,6 +270,11 @@ function createMockAdapter() {
                 return Promise.resolve({ rows: [] });
             }
             return Promise.resolve({ rows: rowsOfType(search, params) });
+        },
+        extendForeignObjectAsync(id, obj) {
+            extended.push(id);
+            objects[id] = { ...objects[id], ...obj };
+            return Promise.resolve({ id });
         },
         setForeignObjectAsync(id, obj) {
             objects[id] = { ...JSON.parse(JSON.stringify(obj)), _id: id };
@@ -364,6 +376,23 @@ function createMockAdapter() {
                 callback(hostLogs.slice());
                 return;
             }
+            if (command === 'cmdExec') {
+                // the host answers asynchronously with messages to the sending instance
+                cmdExec.sent.push({ host, ...message });
+                if (cmdExec.reply) {
+                    setImmediate(() => {
+                        adapter.emit('message', {
+                            command: 'cmdStdout',
+                            message: { id: message.id, data: `install ${message.data}` },
+                        });
+                        adapter.emit('message', {
+                            command: 'cmdExit',
+                            message: { id: message.id, data: cmdExec.exitCode },
+                        });
+                    });
+                }
+                return;
+            }
             callback({ error: `unknown command ${command}` });
         },
         requireLog(enabled) {
@@ -386,6 +415,9 @@ function createMockAdapter() {
             subscriptions.objects = subscriptions.objects.filter(one => one !== pattern);
             return Promise.resolve();
         },
+        supportsFeature(feature) {
+            return feature === 'CONTROLLER_CMD_EXEC_FILES';
+        },
         getSession() {
             return Promise.resolve(null);
         },
@@ -396,7 +428,7 @@ function createMockAdapter() {
         },
     };
 
-    return { adapter, objects, states, files, logged, subscriptions, permissions };
+    return { adapter, objects, states, files, logged, subscriptions, permissions, cmdExec, extended };
 }
 
 module.exports = { createMockAdapter, patternToRegExp };

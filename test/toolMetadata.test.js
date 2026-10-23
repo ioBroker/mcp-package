@@ -20,6 +20,7 @@ const ALL_TOOLS = [
     'get_object',
     'get_states',
     'history_query',
+    'install_package',
     'list_adapters',
     'list_devices',
     'list_files',
@@ -55,6 +56,9 @@ const OBJECT_CHANGE_TOOLS = [
     'rename_file',
     'mkdir',
 ];
+
+/** Tools gated behind `allowPackageInstall`. */
+const PACKAGE_INSTALL_TOOLS = ['install_package'];
 
 /** Tools that must not modify anything. */
 const READ_ONLY_TOOLS = [
@@ -136,16 +140,16 @@ describe('tool metadata', () => {
             assert.equal(byName[name].annotations.readOnlyHint, true, `${name} should be read-only`);
             assert.equal(byName[name].annotations.destructiveHint, false, `${name} must not be destructive`);
         }
-        for (const name of [...STATE_WRITE_TOOLS, ...OBJECT_CHANGE_TOOLS, 'write_log']) {
+        for (const name of [...STATE_WRITE_TOOLS, ...OBJECT_CHANGE_TOOLS, ...PACKAGE_INSTALL_TOOLS, 'write_log']) {
             assert.equal(byName[name].annotations.readOnlyHint, false, `${name} must not be read-only`);
         }
     });
 
-    it('flags only ping_host as talking to the outside world', () => {
+    it('flags only ping_host and install_package as talking to the outside world', () => {
         for (const tool of tools) {
             assert.equal(
                 tool.annotations.openWorldHint,
-                tool.name === 'ping_host',
+                tool.name === 'ping_host' || tool.name === 'install_package',
                 `${tool.name}: unexpected openWorldHint`,
             );
         }
@@ -167,6 +171,9 @@ describe('tool metadata', () => {
             }
             for (const name of OBJECT_CHANGE_TOOLS) {
                 assert.ok(!names.includes(name), `${name} must stay off by default - allowObjectChange is opt-in`);
+            }
+            for (const name of PACKAGE_INSTALL_TOOLS) {
+                assert.ok(!names.includes(name), `${name} must stay off by default - allowPackageInstall is opt-in`);
             }
         } finally {
             await defaults.close();
@@ -218,6 +225,19 @@ describe('tool metadata', () => {
             await limited.close();
         }
     });
+    it('hides install_package when allowPackageInstall is off', async () => {
+        const { mcp: limited } = await startMcp({ allowPackageInstall: false });
+        try {
+            const names = (await limited.listTools()).map(tool => tool.name);
+            for (const name of PACKAGE_INSTALL_TOOLS) {
+                assert.ok(!names.includes(name), `${name} must not be offered when allowPackageInstall is off`);
+            }
+            assert.ok(names.includes('set_object'), 'the other tools stay available');
+        } finally {
+            await limited.close();
+        }
+    });
+
     /**
      * Both assertions below guard against a split zod installation. The MCP SDK converts and
      * re-wraps the registered schemas with the zod copy from its own dependency tree, which is

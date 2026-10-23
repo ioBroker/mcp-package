@@ -682,3 +682,88 @@ describe('input validation', () => {
         assert.match(result.text, /not found/);
     });
 });
+
+describe('install_package', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('installs from npm on the own host and restarts enabled instances', async () => {
+        ctx.objects['system.adapter.hue.0'] = {
+            _id: 'system.adapter.hue.0',
+            type: 'instance',
+            common: { name: 'hue', enabled: true },
+            native: {},
+        };
+        const data = await callOk(ctx.mcp, 'install_package', { source: 'hue' });
+        assert.equal(ctx.cmdExec.sent.length, 1);
+        assert.equal(ctx.cmdExec.sent[0].host, 'system.host.testhost');
+        assert.equal(ctx.cmdExec.sent[0].data, 'url iobroker.hue --host testhost');
+        assert.equal(data.success, true);
+        assert.equal(data.exitCode, 0);
+        assert.equal(data.adapter, 'hue');
+        assert.deepEqual(data.restartedInstances, ['hue.0']);
+        assert.deepEqual(ctx.extended, ['system.adapter.hue.0']);
+        assert.deepEqual(data.output, ['install url iobroker.hue --host testhost']);
+    });
+
+    it('sends a .tgz from the file storage along with the command', async () => {
+        ctx.files['0_userdata.0']['dev/iobroker.hue-3.9.1.tgz'] = Buffer.from('tgz-data');
+        const data = await callOk(ctx.mcp, 'install_package', {
+            file_path: '0_userdata.0/dev/iobroker.hue-3.9.1.tgz',
+            debug: true,
+        });
+        const sent = ctx.cmdExec.sent[0];
+        assert.equal(sent.data, 'url iobroker.hue-3.9.1.tgz --host testhost --debug');
+        assert.deepEqual(sent.files, [
+            { name: 'iobroker.hue-3.9.1.tgz', file: Buffer.from('tgz-data').toString('base64') },
+        ]);
+        assert.equal(data.adapter, 'hue');
+    });
+
+    it('accepts an inline base64 .tgz', async () => {
+        await callOk(ctx.mcp, 'install_package', {
+            file_name: 'my adapter.tgz',
+            file_content: Buffer.from('x').toString('base64'),
+        });
+        assert.equal(ctx.cmdExec.sent[0].data, 'url my_adapter.tgz --host testhost');
+        assert.equal(ctx.cmdExec.sent[0].files[0].name, 'my_adapter.tgz');
+    });
+
+    it('reports a failed installation and restarts nothing', async () => {
+        ctx.cmdExec.exitCode = 1;
+        const data = await callOk(ctx.mcp, 'install_package', { source: 'ioBroker/ioBroker.hue#main' });
+        assert.equal(data.success, false);
+        assert.equal(data.exitCode, 1);
+        assert.deepEqual(ctx.extended, []);
+    });
+
+    it('returns after the timeout when the host does not answer', async () => {
+        ctx.cmdExec.reply = false;
+        const data = await callOk(ctx.mcp, 'install_package', { source: 'hue', timeout: 1 });
+        assert.equal(data.finished, false);
+        assert.match(data.note, /keeps running/);
+    });
+
+    it('rejects ambiguous, unsafe or unknown input', async () => {
+        for (const args of [
+            {},
+            { source: 'hue', file_path: '0_userdata.0/x.tgz' },
+            { source: 'hue --force' },
+            { source: '--debug' },
+            { source: 'hue', host: 'unknown' },
+            { file_name: 'x.zip', file_content: 'eA==' },
+            { file_content: 'eA==' },
+        ]) {
+            const result = await call(ctx.mcp, 'install_package', args);
+            assert.equal(result.isError, true, `accepted ${JSON.stringify(args)}`);
+        }
+        assert.equal(ctx.cmdExec.sent.length, 0);
+    });
+});
