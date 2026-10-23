@@ -233,7 +233,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.3.0 (2026-10-23)
 * (@GermanBluefox) Added the `install_package` tool (opt-in `allowPackageInstall`, only for developers): installs an adapter package from npm, GitHub, a URL or a `.tgz` file on a host
 
 ### 1.2.3 (2026-10-19)
