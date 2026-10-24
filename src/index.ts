@@ -391,6 +391,9 @@ export default class McpServer {
             this.linksUnavailableReason = '';
         }
         this.linksAvailable = !this.linksUnavailableReason;
+        if (this.linksAvailable) {
+            this.removeStaleTransferDirs();
+        }
         // State writes are declared destructive unless turned off explicitly
         this.config.setStateDestructive = this.config.setStateDestructive !== false;
 
@@ -4465,7 +4468,8 @@ export default class McpServer {
         const token = randomBytes(32).toString('hex');
         // One folder per link, so the file keeps its name (`npm` needs the .tgz extension)
         const folder = nodePath.join(this.transferDir, token);
-        fs.mkdirSync(folder);
+        // recursive: another MCP server may have removed our folder as stale (see removeStaleTransferDirs)
+        fs.mkdirSync(folder, { recursive: true });
         const file = nodePath.join(folder, name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'file');
         if (data !== undefined) {
             fs.writeFileSync(file, data);
@@ -4479,6 +4483,34 @@ export default class McpServer {
             size: data !== undefined ? Buffer.byteLength(data) : undefined,
         });
         return token;
+    }
+
+    /**
+     * Remove the transfer folders that a process left behind when it was killed. Other MCP servers on this
+     * host (web extension, standalone, admin) use the same temp folder, so only folders unchanged for longer
+     * than a link lives are removed: every new link creates a subfolder and so touches its folder.
+     */
+    private removeStaleTransferDirs(): void {
+        const tmp = os.tmpdir();
+        try {
+            for (const name of fs.readdirSync(tmp)) {
+                if (!name.startsWith('iobroker-mcp-')) {
+                    continue;
+                }
+                const dir = nodePath.join(tmp, name);
+                try {
+                    const stat = fs.statSync(dir);
+                    if (stat.isDirectory() && Date.now() - stat.mtimeMs > TRANSFER_TTL) {
+                        fs.rmSync(dir, { recursive: true, force: true });
+                        this.adapter.log.debug(`Removed stale transfer folder "${dir}"`);
+                    }
+                } catch (e) {
+                    this.adapter.log.debug(`Cannot remove stale transfer folder "${dir}": ${e}`);
+                }
+            }
+        } catch (e) {
+            this.adapter.log.debug(`Cannot read "${tmp}": ${e}`);
+        }
     }
 
     /** The public URL of a download or upload link. */

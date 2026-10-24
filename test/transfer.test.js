@@ -201,3 +201,27 @@ describe('links turned off', () => {
         assert.match(json.error, /turned off/);
     });
 });
+
+describe('stale transfer folders', () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+
+    it('removes folders left behind by a killed process, but not fresh ones', async () => {
+        const stale = fs.mkdtempSync(path.join(os.tmpdir(), 'iobroker-mcp-'));
+        fs.mkdirSync(path.join(stale, 'token'));
+        fs.writeFileSync(path.join(stale, 'token', 'file.tgz'), 'x');
+        const old = new Date(Date.now() - 20 * 60_000);
+        fs.utimesSync(stale, old, old);
+        const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'iobroker-mcp-'));
+
+        const ctx = await startHttp();
+        try {
+            assert.equal(fs.existsSync(stale), false, 'the stale folder was kept');
+            assert.equal(fs.existsSync(fresh), true, 'a fresh folder was removed');
+        } finally {
+            await ctx.close();
+            fs.rmSync(fresh, { recursive: true, force: true });
+        }
+    });
+});

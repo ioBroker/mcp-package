@@ -307,6 +307,9 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Transfer folders left behind by a killed process are removed at startup
+
 ### 1.5.0 (2026-10-24)
 * (@GermanBluefox) Tool results are kept below the 1 MiB limit of MCP clients: lists are paged with `offset`, other results are replaced by a download link
 * (@GermanBluefox) Added download links (`read_file` with `download: true`, complete lists) and upload links (`prepare_upload`, used by `write_file` and `install_package`) for large data (option `transferLinks`)
