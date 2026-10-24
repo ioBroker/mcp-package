@@ -25,6 +25,13 @@ async function startHttp(config = {}) {
     const mock = createMockAdapter();
     mock.adapter.config = { bind: '127.0.0.1', allowObjectChange: true, allowPackageInstall: true, ...config };
     const app = express();
+    // Stands in for the authentication, which fills `req.user`
+    app.use((req, _res, next) => {
+        if (req.headers['x-test-user']) {
+            req.user = req.headers['x-test-user'];
+        }
+        next();
+    });
     const mcpServer = new McpServer(null, {}, mock.adapter, null, app);
     const httpServer = await new Promise(resolve => {
         const server = app.listen(0, '127.0.0.1', () => resolve(server));
@@ -32,10 +39,13 @@ async function startHttp(config = {}) {
     const url = `http://127.0.0.1:${httpServer.address().port}/mcp`;
     let id = 1;
 
-    async function post(sessionId, body) {
+    async function post(sessionId, body, user) {
         const headers = { accept: 'application/json, text/event-stream', 'content-type': 'application/json' };
         if (sessionId) {
             headers['mcp-session-id'] = sessionId;
+        }
+        if (user) {
+            headers['x-test-user'] = user;
         }
         const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
         return {
@@ -45,18 +55,32 @@ async function startHttp(config = {}) {
         };
     }
 
-    const init = await post(undefined, INITIALIZE);
-    assert.equal(init.status, 200, init.text);
-    const sessionId = init.sessionId;
-    await post(sessionId, { jsonrpc: '2.0', method: 'notifications/initialized' });
-
-    /** Send a JSON-RPC request and return its result (the answer comes as a server-sent event). */
-    async function request(method, params) {
-        const answer = await post(sessionId, { jsonrpc: '2.0', id: ++id, method, params });
-        assert.equal(answer.status, 200, answer.text);
-        const line = answer.text.split('\n').find(one => one.startsWith('data: '));
-        return JSON.parse(line.substring(6)).result;
+    /**
+     * Open an MCP session
+     *
+     * @param user the logged-in user, none for an anonymous session
+     * @returns a function that sends a JSON-RPC request and returns its result (it comes as a server-sent event)
+     */
+    async function openSession(user) {
+        const init = await post(undefined, INITIALIZE, user);
+        assert.equal(init.status, 200, init.text);
+        const sessionId = init.sessionId;
+        await post(sessionId, { jsonrpc: '2.0', method: 'notifications/initialized' }, user);
+        return async (method, params) => {
+            const answer = await post(sessionId, { jsonrpc: '2.0', id: ++id, method, params }, user);
+            assert.equal(answer.status, 200, answer.text);
+            const line = answer.text.split('\n').find(one => one.startsWith('data: '));
+            return JSON.parse(line.substring(6)).result;
+        };
     }
+
+    /** Call a tool and return `{ isError, json }`. */
+    async function callTool(request, name, args) {
+        const result = await request('tools/call', { name, arguments: args });
+        return { isError: !!result.isError, json: JSON.parse(result.content[0].text) };
+    }
+
+    const request = await openSession();
 
     return {
         ...mock,
@@ -64,10 +88,11 @@ async function startHttp(config = {}) {
         async listTools() {
             return (await request('tools/list', {})).tools.map(tool => tool.name);
         },
-        /** Call a tool and return `{ isError, json }`. */
-        async call(name, args) {
-            const result = await request('tools/call', { name, arguments: args });
-            return { isError: !!result.isError, json: JSON.parse(result.content[0].text) };
+        call: (name, args) => callTool(request, name, args),
+        /** Open a session of the given user and return its `call` function. */
+        async sessionOf(user) {
+            const userRequest = await openSession(user);
+            return (name, args) => callTool(userRequest, name, args);
         },
         async close() {
             mcpServer.unload();
@@ -160,6 +185,25 @@ describe('download and upload links', () => {
         // An upload is used once
         const again = await ctx.call('write_file', { path: '0_userdata.0/folder/data.bin', upload_id });
         assert.match(again.json.error, /Unknown or expired upload/);
+    });
+
+    it('lets only the user that created an upload use it', async () => {
+        const callA = await ctx.sessionOf('alice');
+        const callB = await ctx.sessionOf('bob');
+        const { json } = await callA('prepare_upload', { name: 'data.bin' });
+        assert.equal((await fetch(json.data.url, { method: 'PUT', body: 'data' })).status, 200);
+
+        // Neither another user nor an anonymous session can use it, and they learn nothing about it
+        const path = '0_userdata.0/folder/data.bin';
+        const other = await callB('write_file', { path, upload_id: json.data.upload_id });
+        assert.match(other.json.error, /Unknown or expired upload/);
+        const anonymous = await ctx.call('write_file', { path, upload_id: json.data.upload_id });
+        assert.match(anonymous.json.error, /Unknown or expired upload/);
+        assert.equal(ctx.files['0_userdata.0']['folder/data.bin'], undefined);
+
+        const own = await callA('write_file', { path, upload_id: json.data.upload_id });
+        assert.equal(own.isError, false, JSON.stringify(own.json));
+        assert.equal(ctx.files['0_userdata.0']['folder/data.bin'].toString(), 'data');
     });
 
     it('installs an uploaded .tgz with install_package', async () => {

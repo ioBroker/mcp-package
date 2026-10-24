@@ -215,6 +215,8 @@ interface Transfer {
     expires: number;
     /** Size in bytes; undefined for an upload link that was not used yet */
     size?: number;
+    /** The user that created the link; only this user can use an upload in a tool */
+    user: `system.user.${string}`;
 }
 
 /** A running `cmdExec` on a host, started by `install_package`. */
@@ -4526,6 +4528,7 @@ export default class McpServer {
             contentType,
             expires: Date.now() + TRANSFER_TTL,
             size: data !== undefined ? Buffer.byteLength(data) : undefined,
+            user: this.user,
         });
         return token;
     }
@@ -4657,10 +4660,13 @@ export default class McpServer {
         });
     }
 
-    /** Get a received upload by its id, failing if it is unknown, expired or still empty. */
+    /**
+     * Get a received upload by its id, failing if it is unknown, expired or still empty. An upload of
+     * another user is reported as unknown, so a leaked id gives neither access nor a hint that it exists.
+     */
     private getUpload(uploadId: string): Transfer {
         const transfer = this.transfers.get(uploadId);
-        if (!transfer || transfer.kind !== 'upload' || transfer.expires < Date.now()) {
+        if (!transfer || transfer.kind !== 'upload' || transfer.expires < Date.now() || transfer.user !== this.user) {
             throw new Error(`Unknown or expired upload "${uploadId}" - create a new one with prepare_upload`);
         }
         if (transfer.size === undefined) {

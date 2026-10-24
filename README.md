@@ -310,6 +310,9 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) An upload can only be used by the user that created it with `prepare_upload`
+
 ### 1.6.0 (2026-10-24)
 * (@GermanBluefox) With authentication, the tools run with the permissions of the logged-in user instead of the default user; a session can only be used by the user that opened it
 * (@GermanBluefox) As a web extension, the default user of the `web` instance is used
