@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomBytes, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import net from 'node:net';
@@ -134,6 +135,8 @@ interface SessionContext {
     server: McpSdkServer;
     /** Canonical ioBroker URIs this session subscribed to (e.g. iobstate://id, iobobject://id, ioblog://all). */
     subscriptions: Set<string>;
+    /** The ioBroker user that opened the session; all its requests run with this user's permissions. */
+    user: `system.user.${string}`;
 }
 
 /** URI prefix for the (non-standard, ioBroker-specific) log stream resource. */
@@ -281,8 +284,10 @@ export default class McpServer {
     private config: McpConfig;
     private readonly extension: boolean;
     private readonly routerPrefix: string;
-    /** The ioBroker user whose permissions every MCP request runs with. */
+    /** The ioBroker user whose permissions MCP requests run with when no user is logged in. */
     private readonly defaultUser: `system.user.${string}`;
+    /** The user of the MCP request being processed, set by {@link runAs} for each HTTP request. */
+    private readonly requestUser = new AsyncLocalStorage<`system.user.${string}`>();
     /** Default language used to localize device/room/function names. */
     private readonly language: ioBroker.Languages;
     /**
@@ -351,13 +356,14 @@ export default class McpServer {
         // matches both `/mcp` and `/mcp/` (Express, non-strict).
         this.mcpPath = this.extension ? this.routerPrefix.replace(/\/$/, '') : '/mcp';
 
-        // Determine the ioBroker user whose permissions all MCP requests run with.
-        // Prefer this adapter's own setting; when embedded, fall back to the host web server's
-        // default user; finally to "admin". Always normalize to the "system.user." prefix.
-        const rawUser = this.config.defaultUser || webSettings.defaultUser || 'admin';
-        this.defaultUser = (
-            rawUser.startsWith('system.user.') ? rawUser : `system.user.${rawUser}`
-        ) as `system.user.${string}`;
+        // Determine the ioBroker user whose permissions unauthenticated MCP requests run with.
+        // As a web extension the host `web` instance decides about authentication, so its default
+        // user wins there; otherwise prefer this adapter's own setting. Finally fall back to "admin".
+        const rawUser =
+            (this.extension
+                ? webSettings.defaultUser || this.config.defaultUser
+                : this.config.defaultUser || webSettings.defaultUser) || 'admin';
+        this.defaultUser = McpServer.toUserId(rawUser);
         this.config.defaultUser = this.defaultUser;
         this.language = webSettings.language || 'en';
 
@@ -782,16 +788,64 @@ export default class McpServer {
         };
     }
 
+    /** Normalize a plain user name or a `system.user.*` id to the full id. */
+    private static toUserId(user: string): `system.user.${string}` {
+        return (user.startsWith('system.user.') ? user : `system.user.${user}`) as `system.user.${string}`;
+    }
+
+    /**
+     * The ioBroker user a request runs as: the logged-in user when the request was authenticated (by
+     * us or, as a web extension, by the host `web` instance), otherwise the default user.
+     */
+    private getRequestUser(req: Request): `system.user.${string}` {
+        const user = (req as AuthenticatedRequest).user;
+        return user ? McpServer.toUserId(user) : this.defaultUser;
+    }
+
+    /** The user the current tool call runs as. Outside a request (embedded mode) the default user. */
+    private get user(): `system.user.${string}` {
+        return this.requestUser.getStore() || this.defaultUser;
+    }
+
+    /**
+     * Process a request of a session with the permissions of the session's user. The SDK dispatches the
+     * contained messages within this call, so every tool reached from here sees that user in {@link user}.
+     */
+    private runAs(user: `system.user.${string}`, handle: () => Promise<void>): Promise<void> {
+        return this.requestUser.run(user, handle);
+    }
+
+    /**
+     * Get the session of a request. A session is bound to the user that opened it: requests of another
+     * user are answered like an unknown session, so that a leaked session id gives no access.
+     */
+    private getSession(req: Request, res: Response, sessionId: string): SessionContext | undefined {
+        const session = this.sessions[sessionId];
+        if (session && session.user !== this.getRequestUser(req)) {
+            this.adapter.log.warn(
+                `Rejected MCP request from ${req.ip}: session ${sessionId} belongs to another user than ${this.getRequestUser(req)}`,
+            );
+            this.sendSessionNotFound(res, sessionId);
+            return undefined;
+        }
+        if (!session) {
+            this.sendSessionNotFound(res, sessionId);
+        }
+        return session;
+    }
+
     /** Handle client -> server messages (initialize, tools/call, ...). */
     private async handleMcpPost(req: Request, res: Response): Promise<void> {
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        let transport = sessionId ? this.sessions[sessionId]?.transport : undefined;
+        const user = this.getRequestUser(req);
+        let transport: StreamableHTTPServerTransport | undefined;
 
-        if (!transport) {
-            if (sessionId) {
-                this.sendSessionNotFound(res, sessionId);
+        if (sessionId) {
+            transport = this.getSession(req, res, sessionId)?.transport;
+            if (!transport) {
                 return;
             }
+        } else {
             // No session yet: only an "initialize" request may create one.
             if (!isInitializeRequest(req.body)) {
                 res.status(400).json({
@@ -808,8 +862,8 @@ export default class McpServer {
             transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: () => randomUUID(),
                 onsessioninitialized: (sid: string) => {
-                    this.sessions[sid] = { transport: transport!, server, subscriptions };
-                    this.adapter.log.debug(`MCP session initialized: ${sid}`);
+                    this.sessions[sid] = { transport: transport!, server, subscriptions, user };
+                    this.adapter.log.debug(`MCP session initialized: ${sid} (user ${user})`);
                 },
             });
 
@@ -825,22 +879,21 @@ export default class McpServer {
             await server.connect(transport);
         }
 
-        await transport.handleRequest(req, res, req.body);
+        const sessionTransport = transport;
+        await this.runAs(user, () => sessionTransport.handleRequest(req, res, req.body));
     }
 
     /** Handle server -> client SSE stream (GET) and session termination (DELETE). */
     private async handleMcpSessionRequest(req: Request, res: Response): Promise<void> {
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        const transport = sessionId ? this.sessions[sessionId]?.transport : undefined;
-        if (!transport) {
-            if (sessionId) {
-                this.sendSessionNotFound(res, sessionId);
-                return;
-            }
+        if (!sessionId) {
             res.status(400).send('Invalid or missing session ID');
             return;
         }
-        await transport.handleRequest(req, res);
+        const session = this.getSession(req, res, sessionId);
+        if (session) {
+            await this.runAs(session.user, () => session.transport.handleRequest(req, res));
+        }
     }
 
     /**
@@ -1530,7 +1583,7 @@ export default class McpServer {
             },
             async ({ id }) => {
                 try {
-                    const object = await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser });
+                    const object = await this.adapter.getForeignObjectAsync(id, { user: this.user });
                     return ok({ ok: true, data: { object: object ?? null } });
                 } catch (e) {
                     return fail(e);
@@ -1579,7 +1632,7 @@ export default class McpServer {
                         }
                         const { adapterName, fileName } = McpServer.parseFilePath(path);
                         const file = await this.adapter.readFileAsync(adapterName, fileName, {
-                            user: this.defaultUser,
+                            user: this.user,
                         });
                         const data = Buffer.isBuffer(file.file) ? file.file : Buffer.from(file.file || '');
                         const mimeType = file.mimeType || 'application/octet-stream';
@@ -1632,7 +1685,7 @@ export default class McpServer {
                 try {
                     const { adapterName, fileName } = McpServer.parseFilePath(path);
                     const exists = await this.adapter.fileExistsAsync(adapterName, fileName, {
-                        user: this.defaultUser,
+                        user: this.user,
                     });
                     return ok({ ok: true, data: { path, exists: !!exists } });
                 } catch (e) {
@@ -1880,7 +1933,7 @@ export default class McpServer {
                             const upload = this.getUpload(upload_id);
                             const { adapterName, fileName } = McpServer.parseFilePath(path);
                             await this.adapter.writeFileAsync(adapterName, fileName, fs.readFileSync(upload.file), {
-                                user: this.defaultUser,
+                                user: this.user,
                             });
                             this.removeTransfer(upload_id);
                             return ok({ ok: true, data: { path, size: upload.size } });
@@ -1909,7 +1962,7 @@ export default class McpServer {
                 async ({ path }) => {
                     try {
                         const { adapterName, fileName } = McpServer.parseFilePath(path);
-                        await this.adapter.delFileAsync(adapterName, fileName, { user: this.defaultUser });
+                        await this.adapter.delFileAsync(adapterName, fileName, { user: this.user });
                         return ok({ ok: true, data: { path, deleted: true } });
                     } catch (e) {
                         return fail(e);
@@ -1966,7 +2019,7 @@ export default class McpServer {
                                 'Path must contain a directory after the adapter, e.g. "0_userdata.0/my-folder"',
                             );
                         }
-                        await this.adapter.mkdirAsync(adapterName, dirName, { user: this.defaultUser });
+                        await this.adapter.mkdirAsync(adapterName, dirName, { user: this.user });
                         return ok({ ok: true, data: { path } });
                     } catch (e) {
                         return fail(e);
@@ -2668,7 +2721,7 @@ export default class McpServer {
             },
             async (uri, variables) => {
                 const id = decodeURIComponent(String(variables.id));
-                const state = await this.adapter.getForeignStateAsync(id, { user: this.defaultUser });
+                const state = await this.adapter.getForeignStateAsync(id, { user: this.user });
                 const body = state
                     ? { id, val: state.val, ack: state.ack, ts: state.ts, lc: state.lc, q: state.q }
                     : { id, val: null };
@@ -2686,7 +2739,7 @@ export default class McpServer {
             },
             async (uri, variables) => {
                 const id = decodeURIComponent(String(variables.id));
-                const obj = await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser });
+                const obj = await this.adapter.getForeignObjectAsync(id, { user: this.user });
                 return {
                     contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(obj ?? null) }],
                 };
@@ -2758,12 +2811,12 @@ export default class McpServer {
             try {
                 if (id.includes('*')) {
                     // Wildcard pattern: expand to all matching states.
-                    const matches = await this.adapter.getForeignStatesAsync(id, { user: this.defaultUser });
+                    const matches = await this.adapter.getForeignStatesAsync(id, { user: this.user });
                     for (const matchId of Object.keys(matches || {})) {
                         states.push(McpServer.stateEntry(matchId, matches[matchId]));
                     }
                 } else {
-                    const state = await this.adapter.getForeignStateAsync(id, { user: this.defaultUser });
+                    const state = await this.adapter.getForeignStateAsync(id, { user: this.user });
                     states.push(McpServer.stateEntry(id, state));
                 }
             } catch (e) {
@@ -2781,7 +2834,7 @@ export default class McpServer {
 
     /**
      * Write multiple states as one operation: the write permission of every state is verified first, so a
-     * batch containing a single state the default user may not write fails as a whole and nothing is
+     * batch containing a single state the user may not write fails as a whole and nothing is
      * written. Other failures of single states are reported per item and do not abort the rest.
      */
     private async setStates(
@@ -2801,7 +2854,7 @@ export default class McpServer {
     }
 
     /**
-     * Verify that the default user may write every given state, mirroring the checks js-controller runs in
+     * Verify that the user of the request may write every given state, mirroring the checks js-controller runs in
      * `setForeignState`: the user must be able to read the object (needed for the type coercion in
      * {@link setState}) and the state ACL must allow writing — for an alias also on its write target.
      *
@@ -2809,10 +2862,10 @@ export default class McpServer {
      * @throws {Error} when at least one state may not be written; the message lists all of them
      */
     private async assertStatesWritable(ids: string[]): Promise<void> {
-        if (this.defaultUser === 'system.user.admin') {
+        if (this.user === 'system.user.admin') {
             return;
         }
-        const permissions = await this.adapter.calculatePermissionsAsync(this.defaultUser, []);
+        const permissions = await this.adapter.calculatePermissionsAsync(this.user, []);
         if (permissions.groups?.includes('system.group.administrator')) {
             return;
         }
@@ -2820,7 +2873,7 @@ export default class McpServer {
         for (const id of new Set(ids)) {
             let obj: ioBroker.Object | null | undefined;
             try {
-                obj = await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser });
+                obj = await this.adapter.getForeignObjectAsync(id, { user: this.user });
             } catch {
                 denied.push(id);
                 continue;
@@ -2839,7 +2892,7 @@ export default class McpServer {
         }
         if (denied.length) {
             throw new Error(
-                `permissionError: user "${this.defaultUser}" may not write ${denied.join(', ')} - nothing was written`,
+                `permissionError: user "${this.user}" may not write ${denied.join(', ')} - nothing was written`,
             );
         }
     }
@@ -2848,7 +2901,7 @@ export default class McpServer {
      * The state ACL check of js-controller for `setState` on a single object.
      *
      * @param obj the state object (objects without ACL are not restricted by js-controller)
-     * @param permissions the merged group permissions of the default user
+     * @param permissions the merged group permissions of the user
      */
     private isStateWritable(obj: ioBroker.Object | null | undefined, permissions: ioBroker.PermissionSet): boolean {
         const acl = obj?.acl as Partial<ioBroker.StateACL> | undefined;
@@ -2860,7 +2913,7 @@ export default class McpServer {
             return false;
         }
         let mask = 0x002; // everyone write
-        if (acl.owner === this.defaultUser) {
+        if (acl.owner === this.user) {
             mask = 0x200; // owner write
         } else if (acl.ownerGroup && permissions.groups?.includes(acl.ownerGroup)) {
             mask = 0x020; // group write
@@ -3177,13 +3230,13 @@ export default class McpServer {
 
     private async getSystemInfo(): Promise<Record<string, unknown>> {
         const hostObj = await this.adapter.getForeignObjectAsync(`system.host.${this.adapter.host}`, {
-            user: this.defaultUser,
+            user: this.user,
         });
         const jsControllerVersion = hostObj?.common?.installedVersion || 'unknown';
         const totalMem = Math.round(os.totalmem() / (1024 * 1024));
         const freeMem = Math.round(os.freemem() / (1024 * 1024));
         const instanceObjs = await this.adapter.getForeignObjectsAsync('system.adapter.*', 'instance', {
-            user: this.defaultUser,
+            user: this.user,
         });
 
         return {
@@ -3211,7 +3264,7 @@ export default class McpServer {
                 startkey: '',
                 endkey: '\u9999',
             },
-            { sorted: true, user: this.defaultUser },
+            { sorted: true, user: this.user },
         );
         const allObjects = result.rows;
         const roomMembers = room ? await this.getEnumMembers('enum.rooms.', room) : null;
@@ -3250,7 +3303,7 @@ export default class McpServer {
 
     private async listDevices(params: { language?: ioBroker.Languages; room?: string }): Promise<Room[]> {
         const lang = params.language || this.language;
-        const rooms = await getAiFriendlyStructure(this.adapter, lang, { user: this.defaultUser });
+        const rooms = await getAiFriendlyStructure(this.adapter, lang, { user: this.user });
         if (params.room) {
             const needle = params.room.toLowerCase();
             return rooms.filter(r => r.roomName.toLowerCase() === needle);
@@ -3290,7 +3343,7 @@ export default class McpServer {
             options.step = step;
         }
         // GetHistoryOptions has no typed `user` field, but the controller honors it for ACL checks.
-        (options as Record<string, unknown>).user = this.defaultUser;
+        (options as Record<string, unknown>).user = this.user;
 
         const res = await this.adapter.getHistoryAsync(params.id, options);
         return { id: params.id, values: res?.result || [] };
@@ -3298,14 +3351,14 @@ export default class McpServer {
 
     private async listInstances(): Promise<Record<string, unknown>[]> {
         const objs = await this.adapter.getForeignObjectsAsync('system.adapter.*', 'instance', {
-            user: this.defaultUser,
+            user: this.user,
         });
         const result: Record<string, unknown>[] = [];
         for (const [fullId, obj] of Object.entries(objs || {})) {
             const id = fullId.replace('system.adapter.', '');
-            const aliveState = await this.adapter.getForeignStateAsync(`${fullId}.alive`, { user: this.defaultUser });
+            const aliveState = await this.adapter.getForeignStateAsync(`${fullId}.alive`, { user: this.user });
             const connState = await this.adapter.getForeignStateAsync(`${fullId}.connected`, {
-                user: this.defaultUser,
+                user: this.user,
             });
             result.push({
                 id,
@@ -3326,7 +3379,7 @@ export default class McpServer {
             'system',
             'adapter',
             { startkey: 'system.adapter.', endkey: 'system.adapter.香' },
-            { user: this.defaultUser },
+            { user: this.user },
         );
         return view.rows.map(row => {
             const common = (row.value?.common || {}) as Record<string, any>;
@@ -3367,7 +3420,7 @@ export default class McpServer {
             'system',
             'adapter',
             { startkey: 'system.adapter.', endkey: 'system.adapter.香' },
-            { user: this.defaultUser },
+            { user: this.user },
         );
         const installed = new Set(
             installedView.rows.map(row => row.value?.common?.name || row.id.replace('system.adapter.', '')),
@@ -3411,10 +3464,10 @@ export default class McpServer {
     }
 
     private async listHosts(): Promise<Record<string, unknown>[]> {
-        const objs = await this.adapter.getForeignObjectsAsync('system.host.*', 'host', { user: this.defaultUser });
+        const objs = await this.adapter.getForeignObjectsAsync('system.host.*', 'host', { user: this.user });
         const result: Record<string, unknown>[] = [];
         for (const [fullId, obj] of Object.entries(objs || {})) {
-            const aliveState = await this.adapter.getForeignStateAsync(`${fullId}.alive`, { user: this.defaultUser });
+            const aliveState = await this.adapter.getForeignStateAsync(`${fullId}.alive`, { user: this.user });
             result.push({
                 id: fullId.replace('system.host.', ''),
                 alive: !!aliveState?.val,
@@ -3438,7 +3491,7 @@ export default class McpServer {
             'system',
             'enum',
             { startkey: `enum.${type}.`, endkey: `enum.${type}.香` },
-            { user: this.defaultUser },
+            { user: this.user },
         );
 
         const result: EnumResponse[] = [];
@@ -3462,7 +3515,7 @@ export default class McpServer {
                 if (obj === undefined) {
                     try {
                         cache[member] =
-                            (await this.adapter.getForeignObjectAsync(member, { user: this.defaultUser })) || false;
+                            (await this.adapter.getForeignObjectAsync(member, { user: this.user })) || false;
                     } catch {
                         cache[member] = false;
                     }
@@ -3491,10 +3544,10 @@ export default class McpServer {
 
     /** Write a state, coercing the value to the state's declared type (boolean/number/string). */
     private async setState(id: string, value: unknown, ack: boolean): Promise<ioBroker.StateValue> {
-        const obj = await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser });
+        const obj = await this.adapter.getForeignObjectAsync(id, { user: this.user });
         const stateType = (obj?.common as AnyCommon | undefined)?.type;
         const coerced = McpServer.coerceValue(value, stateType);
-        await this.adapter.setForeignStateAsync(id, coerced, ack, { user: this.defaultUser });
+        await this.adapter.setForeignStateAsync(id, coerced, ack, { user: this.user });
         return coerced;
     }
 
@@ -3570,7 +3623,7 @@ export default class McpServer {
         nextOffset?: number;
     }> {
         const { adapterName, fileName } = McpServer.parseFilePath(path);
-        const data = await this.adapter.readFileAsync(adapterName, fileName, { user: this.defaultUser });
+        const data = await this.adapter.readFileAsync(adapterName, fileName, { user: this.user });
         const file = (data as { file?: string | Buffer })?.file;
         const mimeType = (data as { mimeType?: string })?.mimeType;
         if (file === undefined || file === null) {
@@ -3619,13 +3672,13 @@ export default class McpServer {
     private async writeFile(path: string, content: string, base64?: boolean): Promise<void> {
         const { adapterName, fileName } = McpServer.parseFilePath(path);
         const data: string | Buffer = base64 ? Buffer.from(content, 'base64') : content;
-        await this.adapter.writeFileAsync(adapterName, fileName, data, { user: this.defaultUser });
+        await this.adapter.writeFileAsync(adapterName, fileName, data, { user: this.user });
     }
 
     /** List a directory in an adapter file storage. */
     private async listFiles(path: string): Promise<Record<string, unknown>[]> {
         const { adapterName, dirName } = McpServer.parseDirPath(path);
-        const entries = await this.adapter.readDirAsync(adapterName, dirName, { user: this.defaultUser });
+        const entries = await this.adapter.readDirAsync(adapterName, dirName, { user: this.user });
         return (entries || []).map(entry => ({
             file: entry.file,
             isDir: !!entry.isDir,
@@ -3641,12 +3694,12 @@ export default class McpServer {
         if (from.adapterName !== to.adapterName) {
             throw new Error('Renaming across adapter storages is not supported; both paths must share the adapter');
         }
-        await this.adapter.renameAsync(from.adapterName, from.fileName, to.fileName, { user: this.defaultUser });
+        await this.adapter.renameAsync(from.adapterName, from.fileName, to.fileName, { user: this.user });
     }
 
     /** Create or update an object, merging common/native into an existing object (n8n `setIobObject`). */
     private async setObject(id: string, obj: Partial<ioBroker.Object>): Promise<{ id: string }> {
-        let existing = await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser });
+        let existing = await this.adapter.getForeignObjectAsync(id, { user: this.user });
         if (existing) {
             if (obj.common) {
                 existing.common = { ...existing.common, ...obj.common } as ioBroker.ObjectCommon;
@@ -3657,7 +3710,7 @@ export default class McpServer {
         } else {
             existing = obj as ioBroker.Object;
         }
-        return this.adapter.setForeignObjectAsync(id, existing, { user: this.defaultUser });
+        return this.adapter.setForeignObjectAsync(id, existing, { user: this.user });
     }
 
     /** Split a file path "<adapter>/<dir>/<file>" into adapter name and file name. */
@@ -3684,11 +3737,11 @@ export default class McpServer {
 
     /** Delete an object, optionally with all its children. */
     private async deleteObject(id: string, recursive?: boolean): Promise<void> {
-        const existing = await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser });
+        const existing = await this.adapter.getForeignObjectAsync(id, { user: this.user });
         if (!existing) {
             throw new Error(`Object "${id}" does not exist`);
         }
-        await this.adapter.delForeignObjectAsync(id, { user: this.defaultUser, recursive: !!recursive });
+        await this.adapter.delForeignObjectAsync(id, { user: this.user, recursive: !!recursive });
     }
 
     /** Create a new state object; refuses to overwrite an existing object. */
@@ -3706,7 +3759,7 @@ export default class McpServer {
         def?: unknown;
         desc?: string;
     }): Promise<{ id: string }> {
-        const existing = await this.adapter.getForeignObjectAsync(params.id, { user: this.defaultUser });
+        const existing = await this.adapter.getForeignObjectAsync(params.id, { user: this.user });
         if (existing) {
             throw new Error(`Object "${params.id}" already exists - use set_object to modify it`);
         }
@@ -3732,14 +3785,10 @@ export default class McpServer {
         if (params.desc !== undefined) {
             common.desc = params.desc;
         }
-        await this.adapter.setForeignObjectAsync(
-            params.id,
-            { type: 'state', common, native: {} },
-            { user: this.defaultUser },
-        );
+        await this.adapter.setForeignObjectAsync(params.id, { type: 'state', common, native: {} }, { user: this.user });
         if (params.def !== undefined) {
             const coerced = McpServer.coerceValue(params.def, common.type);
-            await this.adapter.setForeignStateAsync(params.id, coerced, true, { user: this.defaultUser });
+            await this.adapter.setForeignStateAsync(params.id, coerced, true, { user: this.user });
         }
         return { id: params.id };
     }
@@ -3753,7 +3802,7 @@ export default class McpServer {
     }): Promise<{ id: string; members: number }> {
         const instance = params.instance || 'scene.0';
         const instanceObj = await this.adapter.getForeignObjectAsync(`system.adapter.${instance}`, {
-            user: this.defaultUser,
+            user: this.user,
         });
         if (!instanceObj) {
             throw new Error(
@@ -3791,7 +3840,7 @@ export default class McpServer {
                 burstInterval: 0,
             },
         };
-        await this.adapter.setForeignObjectAsync(id, sceneObj, { user: this.defaultUser });
+        await this.adapter.setForeignObjectAsync(id, sceneObj, { user: this.user });
         return { id, members: params.members.length };
     }
 
@@ -3842,7 +3891,7 @@ export default class McpServer {
             let data: Buffer;
             if (params.file_path !== undefined) {
                 const { adapterName, fileName: storageName } = McpServer.parseFilePath(params.file_path);
-                const result = await this.adapter.readFileAsync(adapterName, storageName, { user: this.defaultUser });
+                const result = await this.adapter.readFileAsync(adapterName, storageName, { user: this.user });
                 data = Buffer.isBuffer(result.file) ? result.file : Buffer.from(result.file || '');
                 fileName = storageName.split('/').pop() || '';
             } else if (upload) {
@@ -3894,7 +3943,7 @@ export default class McpServer {
         if (!name || /\s/.test(name)) {
             throw new Error(`Invalid host "${name}"`);
         }
-        const hostObj = await this.adapter.getForeignObjectAsync(`system.host.${name}`, { user: this.defaultUser });
+        const hostObj = await this.adapter.getForeignObjectAsync(`system.host.${name}`, { user: this.user });
         if (hostObj?.type !== 'host') {
             throw new Error(`Host "${name}" not found`);
         }
@@ -3967,12 +4016,12 @@ export default class McpServer {
     /** Like admin after an installation: touching the instance objects makes the controller restart them. */
     private async restartAdapterInstances(adapterName: string): Promise<string[]> {
         const instances = await this.adapter.getForeignObjectsAsync(`system.adapter.${adapterName}.*`, 'instance', {
-            user: this.defaultUser,
+            user: this.user,
         });
         const restarted: string[] = [];
         for (const [instanceId, instance] of Object.entries(instances || {})) {
             if (instance?.common?.enabled) {
-                await this.adapter.extendForeignObjectAsync(instanceId, {}, { user: this.defaultUser });
+                await this.adapter.extendForeignObjectAsync(instanceId, {}, { user: this.user });
                 restarted.push(instanceId.replace('system.adapter.', ''));
             }
         }
@@ -3986,7 +4035,7 @@ export default class McpServer {
             throw new Error(`Invalid instance "${id}", expected e.g. "hue.0"`);
         }
         const fullId = `system.adapter.${shortId}`;
-        const obj = await this.adapter.getForeignObjectAsync(fullId, { user: this.defaultUser });
+        const obj = await this.adapter.getForeignObjectAsync(fullId, { user: this.user });
         if (obj?.type !== 'instance') {
             throw new Error(`Instance "${shortId}" not found`);
         }
@@ -3998,11 +4047,7 @@ export default class McpServer {
         const instance = await this.getInstance(id);
         const changed = !!instance.obj.common.enabled !== enabled;
         if (changed) {
-            await this.adapter.extendForeignObjectAsync(
-                instance.fullId,
-                { common: { enabled } },
-                { user: this.defaultUser },
-            );
+            await this.adapter.extendForeignObjectAsync(instance.fullId, { common: { enabled } }, { user: this.user });
         }
         return { id: instance.id, enabled, changed };
     }
@@ -4013,7 +4058,7 @@ export default class McpServer {
         if (!instance.obj.common.enabled) {
             throw new Error(`Instance "${instance.id}" is not enabled - start it instead`);
         }
-        await this.adapter.extendForeignObjectAsync(instance.fullId, {}, { user: this.defaultUser });
+        await this.adapter.extendForeignObjectAsync(instance.fullId, {}, { user: this.user });
         return { id: instance.id, restarted: true };
     }
 
@@ -4031,11 +4076,11 @@ export default class McpServer {
             await this.adapter.extendForeignObjectAsync(
                 instance.fullId,
                 { common: { loglevel: level } },
-                { user: this.defaultUser },
+                { user: this.user },
             );
         } else {
             await this.adapter.setForeignStateAsync(`${instance.fullId}.logLevel`, level, false, {
-                user: this.defaultUser,
+                user: this.user,
             });
         }
         return { id: instance.id, level, persistent: !!persistent };
@@ -4065,7 +4110,7 @@ export default class McpServer {
         if (params.instance !== undefined) {
             const existing = await this.adapter.getForeignObjectAsync(
                 `system.adapter.${adapterName}.${params.instance}`,
-                { user: this.defaultUser },
+                { user: this.user },
             );
             if (existing) {
                 throw new Error(`Instance "${adapterName}.${params.instance}" already exists`);
@@ -4097,7 +4142,7 @@ export default class McpServer {
             throw new Error(`Invalid version "${params.version}"`);
         }
         const adapterObj = await this.adapter.getForeignObjectAsync(`system.adapter.${adapterName}`, {
-            user: this.defaultUser,
+            user: this.user,
         });
         if (adapterObj?.type !== 'adapter') {
             throw new Error(`Adapter "${adapterName}" is not installed - use add_instance to install it`);
@@ -4130,10 +4175,10 @@ export default class McpServer {
      * matters when the user has custom repos active next to the default one.
      */
     private async getRepositoryJson(): Promise<Record<string, any>> {
-        const reposObj = await this.adapter.getForeignObjectAsync('system.repositories', { user: this.defaultUser });
+        const reposObj = await this.adapter.getForeignObjectAsync('system.repositories', { user: this.user });
         const repositories = (reposObj?.native?.repositories || {}) as Record<string, { json?: Record<string, any> }>;
 
-        const sysCfg = await this.adapter.getForeignObjectAsync('system.config', { user: this.defaultUser });
+        const sysCfg = await this.adapter.getForeignObjectAsync('system.config', { user: this.user });
         const active = sysCfg?.common?.activeRepo;
         const activeNames = Array.isArray(active) ? active : active ? [active] : [];
 
@@ -4243,7 +4288,7 @@ export default class McpServer {
     /** Read a script object, failing if it is missing or not a script. */
     private async getScriptObject(id: string): Promise<{ id: string; obj: ioBroker.Object }> {
         const scriptId = McpServer.scriptId(id);
-        const obj = await this.adapter.getForeignObjectAsync(scriptId, { user: this.defaultUser });
+        const obj = await this.adapter.getForeignObjectAsync(scriptId, { user: this.user });
         if (obj?.type !== 'script') {
             throw new Error(`Script "${scriptId}" not found`);
         }
@@ -4253,7 +4298,7 @@ export default class McpServer {
     /** List the scripts of the javascript adapter (without their source). */
     private async listScripts(folder?: string): Promise<Record<string, unknown>[]> {
         const prefix = folder ? `script.js.${folder.replace(/^script\.js\./, '').replace(/\.$/, '')}.` : 'script.js.';
-        const objs = await this.adapter.getForeignObjectsAsync(`${prefix}*`, 'script', { user: this.defaultUser });
+        const objs = await this.adapter.getForeignObjectsAsync(`${prefix}*`, 'script', { user: this.user });
         return Object.entries(objs || {}).map(([id, obj]) => this.scriptInfo(id, obj));
     }
 
@@ -4270,7 +4315,7 @@ export default class McpServer {
         instance?: string;
     }): Promise<Record<string, unknown>> {
         const scriptId = McpServer.scriptId(params.id);
-        const existing = await this.adapter.getForeignObjectAsync(scriptId, { user: this.defaultUser });
+        const existing = await this.adapter.getForeignObjectAsync(scriptId, { user: this.user });
         if (existing && existing.type !== 'script') {
             throw new Error(`"${scriptId}" exists and is not a script`);
         }
@@ -4286,7 +4331,7 @@ export default class McpServer {
             if (params.enabled !== undefined) {
                 common.enabled = params.enabled;
             }
-            await this.adapter.extendForeignObjectAsync(scriptId, { common }, { user: this.defaultUser });
+            await this.adapter.extendForeignObjectAsync(scriptId, { common }, { user: this.user });
             return { id: scriptId, created: false };
         }
 
@@ -4295,11 +4340,11 @@ export default class McpServer {
         const segments = scriptId.split('.');
         for (let i = 3; i < segments.length; i++) {
             const folderId = segments.slice(0, i).join('.');
-            if (!(await this.adapter.getForeignObjectAsync(folderId, { user: this.defaultUser }))) {
+            if (!(await this.adapter.getForeignObjectAsync(folderId, { user: this.user }))) {
                 await this.adapter.setForeignObjectAsync(
                     folderId,
                     { type: 'channel', common: { name: segments[i - 1] }, native: {} },
-                    { user: this.defaultUser },
+                    { user: this.user },
                 );
             }
         }
@@ -4319,7 +4364,7 @@ export default class McpServer {
                 },
                 native: {},
             } as unknown as ioBroker.ScriptObject,
-            { user: this.defaultUser },
+            { user: this.user },
         );
         return { id: scriptId, created: true };
     }
@@ -4327,14 +4372,14 @@ export default class McpServer {
     /** Enable (start) or disable (stop) a script. */
     private async enableScript(id: string, enabled: boolean): Promise<Record<string, unknown>> {
         const script = await this.getScriptObject(id);
-        await this.adapter.extendForeignObjectAsync(script.id, { common: { enabled } }, { user: this.defaultUser });
+        await this.adapter.extendForeignObjectAsync(script.id, { common: { enabled } }, { user: this.user });
         return { id: script.id, enabled };
     }
 
     /** Delete a script. */
     private async deleteScript(id: string): Promise<Record<string, unknown>> {
         const script = await this.getScriptObject(id);
-        await this.adapter.delForeignObjectAsync(script.id, { user: this.defaultUser });
+        await this.adapter.delForeignObjectAsync(script.id, { user: this.user });
         return { id: script.id, deleted: true };
     }
 
@@ -4354,7 +4399,7 @@ export default class McpServer {
             instance.id,
             'execute',
             { source: params.source, engineType: params.engineType, timeout, verbose: false, logLevel: 'info' },
-            { timeout: timeout + 15_000, user: this.defaultUser },
+            { timeout: timeout + 15_000, user: this.user },
         );
         if (!result || typeof result !== 'object') {
             throw new Error(`"${instance.id}" did not answer - javascript adapter 10.1.0 or newer is required`);
@@ -4386,7 +4431,7 @@ export default class McpServer {
             instance.id,
             params.command,
             (params.message ?? {}) as ioBroker.MessagePayload,
-            { timeout: params.timeout ?? 10_000, user: this.defaultUser },
+            { timeout: params.timeout ?? 10_000, user: this.user },
         );
         return { instance: instance.id, command: params.command, response: response ?? null };
     }
@@ -4407,16 +4452,16 @@ export default class McpServer {
         if (!/^alias\.\d+\.[^*\s]+$/.test(id)) {
             throw new Error(`Invalid alias id "${params.id}"`);
         }
-        if (await this.adapter.getForeignObjectAsync(id, { user: this.defaultUser })) {
+        if (await this.adapter.getForeignObjectAsync(id, { user: this.user })) {
             throw new Error(`Object "${id}" already exists`);
         }
-        const target = await this.adapter.getForeignObjectAsync(params.target, { user: this.defaultUser });
+        const target = await this.adapter.getForeignObjectAsync(params.target, { user: this.user });
         if (target?.type !== 'state') {
             throw new Error(`Target "${params.target}" is not a state`);
         }
         if (params.write_target) {
             const writeTarget = await this.adapter.getForeignObjectAsync(params.write_target, {
-                user: this.defaultUser,
+                user: this.user,
             });
             if (writeTarget?.type !== 'state') {
                 throw new Error(`Write target "${params.write_target}" is not a state`);
@@ -4444,7 +4489,7 @@ export default class McpServer {
         await this.adapter.setForeignObjectAsync(
             id,
             { type: 'state', common, native: {} } as unknown as ioBroker.StateObject,
-            { user: this.defaultUser },
+            { user: this.user },
         );
         return { id, target: params.target, ...(params.write_target ? { write_target: params.write_target } : {}) };
     }
@@ -4628,7 +4673,7 @@ export default class McpServer {
 
     /** Resolve the member ids of a room/function enum matched by id or (localized) name. */
     private async getEnumMembers(prefix: string, nameOrId: string): Promise<string[]> {
-        const enums = await this.adapter.getForeignObjectsAsync(`${prefix}*`, 'enum', { user: this.defaultUser });
+        const enums = await this.adapter.getForeignObjectsAsync(`${prefix}*`, 'enum', { user: this.user });
         const needle = nameOrId.toLowerCase();
         for (const [id, obj] of Object.entries(enums || {})) {
             if (id.toLowerCase() === needle || this.getName(obj?.common?.name).toLowerCase() === needle) {

@@ -7,7 +7,7 @@
  * them into an AI-friendly structure of rooms -> devices -> named controls.
  *
  * All object reads accept an optional `{ user }` so the detection respects the ACLs of
- * the configured default user (see McpServer).
+ * the user of the MCP request (see McpServer).
  */
 import ChannelDetector, { type DetectOptions, type ExternalDetectorState, Types } from '@iobroker/type-detector';
 

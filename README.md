@@ -45,10 +45,13 @@ The adapter can be configured through the ioBroker admin interface using JSONCon
   endpoint is reachable without credentials — only use that on a trusted network or behind a reverse proxy
   that provides its own authentication. As a **web extension** the host `web` instance's authentication
   applies instead, so this switch has no effect there.
-- **Default User**: The ioBroker user whose permissions every MCP request runs with (default: `admin`).
-  All object/state reads and writes performed by the tools are executed in the name of this user, so the
-  user's ACLs are enforced. A plain name like `operator` is automatically expanded to `system.user.operator`.
-  When running as a web extension and no user is set here, the host `web` instance's default user is used.
+- **Default User**: The ioBroker user whose permissions MCP requests run with when authentication is
+  disabled (default: `admin`). With authentication enabled, every session runs with the permissions of the
+  user who logged in, and this setting is not used. All object/state reads and writes performed by the tools
+  are executed in the name of that user, so the user's ACLs are enforced. A plain name like `operator` is
+  automatically expanded to `system.user.operator`. As a web extension the host `web` instance's default user
+  applies. A session is bound to the user that opened it: requests of another user with the same session id
+  are answered with `404 Session not found`.
 - **Enable OAuth**: Offer the browser-based OAuth2 login that MCP clients such as Claude Desktop use when
   a connector is added. In standalone mode this requires *Enable Authentication*. As a **web extension**
   it also works, but the login is then provided by the host `web` instance, so OAuth has to be enabled
@@ -307,6 +310,10 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) With authentication, the tools run with the permissions of the logged-in user instead of the default user; a session can only be used by the user that opened it
+* (@GermanBluefox) As a web extension, the default user of the `web` instance is used
+
 ### 1.5.1 (2026-10-24)
 * (@GermanBluefox) Transfer folders left behind by a killed process are removed at startup
 
