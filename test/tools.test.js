@@ -1183,3 +1183,94 @@ describe('prompts and confirmations', () => {
         }
     });
 });
+
+describe('large results', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    /** Add `count` states with a long name, about 1 KB per search result. */
+    function addBigObjects(count) {
+        for (let i = 0; i < count; i++) {
+            const id = `big.0.state${String(i).padStart(4, '0')}`;
+            ctx.objects[id] = {
+                _id: id,
+                type: 'state',
+                common: { name: `Big state ${i} ${'x'.repeat(1000)}`, type: 'number', role: 'value', read: true },
+                native: {},
+            };
+        }
+    }
+
+    it('search_objects tells when the limit cut the results', async () => {
+        const data = await callOk(ctx.mcp, 'search_objects', { query: '', limit: 2 });
+        assert.equal(data.results.length, 2);
+        assert.equal(data.truncated, true);
+        assert.equal(data.nextOffset, 2);
+        assert.ok(data.total > 2);
+        assert.equal(data.download_url, undefined);
+
+        const next = await callOk(ctx.mcp, 'search_objects', { query: '', limit: 2, offset: 2 });
+        assert.notEqual(next.results[0].id, data.results[0].id);
+    });
+
+    it('search_objects pages a result that is too large for one answer', async () => {
+        addBigObjects(1500);
+        const first = await callOk(ctx.mcp, 'search_objects', { query: 'big.0.', limit: 9999 });
+        assert.equal(first.truncated, true);
+        assert.equal(first.total, 1500);
+        assert.ok(first.results.length > 100 && first.results.length < 1500, `${first.results.length} results`);
+        assert.equal(first.nextOffset, first.results.length);
+        // In-process there is no HTTP server for links
+        assert.equal(first.download_url, undefined);
+        assert.match(first.hint, /offset=nextOffset/);
+
+        const ids = first.results.map(result => result.id);
+        let offset = first.nextOffset;
+        while (offset !== undefined) {
+            const page = await callOk(ctx.mcp, 'search_objects', { query: 'big.0.', limit: 9999, offset });
+            ids.push(...page.results.map(result => result.id));
+            offset = page.nextOffset;
+        }
+        assert.equal(new Set(ids).size, 1500);
+    });
+
+    it('never returns a result above the size limit of the clients', async () => {
+        ctx.objects['big.0.huge'] = {
+            _id: 'big.0.huge',
+            type: 'state',
+            common: {},
+            native: { blob: 'x'.repeat(2_000_000) },
+        };
+        const result = await call(ctx.mcp, 'get_object', { id: 'big.0.huge' });
+        assert.equal(result.isError, true);
+        assert.match(result.json.error, /larger than 900 KB/);
+    });
+
+    it('read_file with download needs links', async () => {
+        const result = await call(ctx.mcp, 'read_file', { path: '0_userdata.0/folder/test.json', download: true });
+        assert.equal(result.isError, true);
+        assert.match(result.json.error, /not available in this mode/);
+    });
+
+    it('write_file needs either content or upload_id', async () => {
+        const none = await call(ctx.mcp, 'write_file', { path: '0_userdata.0/folder/x.txt' });
+        assert.equal(none.isError, true);
+        assert.match(none.json.error, /either "content" or "upload_id"/);
+        const unknown = await call(ctx.mcp, 'write_file', { path: '0_userdata.0/folder/x.txt', upload_id: 'abc' });
+        assert.equal(unknown.isError, true);
+        assert.match(unknown.json.error, /Unknown or expired upload/);
+    });
+
+    it('offers no prepare_upload in-process', async () => {
+        const tools = await ctx.mcp.listTools();
+        assert.ok(tools.length > 0);
+        assert.ok(!tools.some(tool => tool.name === 'prepare_upload'));
+    });
+});

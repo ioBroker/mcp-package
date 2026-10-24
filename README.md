@@ -143,6 +143,8 @@ All options that change the system are **off** by default; turn on only what the
   object or instance is deleted, an instance stopped, an adapter upgraded or installed, a script saved or run, or a
   message sent. Clients without elicitation rely on the `destructiveHint` of the tools and their own confirmation.
   Default: **on**.
+- **Allow download/upload links** (`transferLinks`): Tools may hand out short-lived links for data that is too large
+  for an MCP message, see [Large results and files](#large-results-and-files). Default: **on**.
 
 **Developers**
 - **Allow installing packages (developers only)** (`allowPackageInstall`): Offer the `install_package` tool, which
@@ -183,7 +185,7 @@ Point your MCP client at:
 | `list_rooms`                | List rooms (`enum.rooms.*`) with localized names and member details; optional `language` and `withIcons`                                                                                                                                             |
 | `list_functions`            | List functions (`enum.functions.*`) with localized names and member details; optional `language` and `withIcons`                                                                                                                                     |
 | `history_query`             | Query historical values (requires a history adapter); aggregations: `raw`, `min`, `max`, `avg`, `sum`, `count`, `minmax`, `percentile`, `quantile`, `integral`                                                                                       |
-| `read_file`                 | Read a file from an adapter file storage (optional base64); large files are read in chunks via `offset`/`length` (default 512 KiB per call) — the result carries `size`, `truncated` and `nextOffset`                                                 |
+| `read_file`                 | Read a file from an adapter file storage (optional base64); large files are read in chunks via `offset`/`length` (default 512 KiB per call) — the result carries `size`, `truncated` and `nextOffset`; `download: true` returns a download link instead |
 | `list_files`                | List a directory in an adapter file storage                                                                                                                                                                                                          |
 | `file_exists`               | Check whether a file exists in an adapter file storage                                                                                                                                                                                               |
 | `get_logs`                  | Retrieve recent ioBroker log lines; optional filters by `level` (error/warn/info/debug), source `adapter` and start time (`from_ts`)                                                                                                                 |
@@ -202,11 +204,12 @@ Point your MCP client at:
 | `create_state`              | Create a new state object with type/role/unit/min/max and optional initial value — requires *Allow object/file changes*                                                                                                                              |
 | `create_scene`              | Create or update a scene for the ioBroker `scenes` adapter (state/value pairs applied together) — requires *Allow object/file changes*                                                                                                               |
 | `create_alias`              | Create an alias (`alias.0.*`) pointing to a state, optionally with a separate write state — requires *Allow object/file changes*                                                                                                                     |
-| `write_file`                | Write a file to an adapter file storage — requires *Allow object/file changes*                                                                                                                                                                       |
+| `write_file`                | Write a file to an adapter file storage, from `content` or from a file uploaded via `prepare_upload` (`upload_id`) — requires *Allow object/file changes*                                                                                              |
 | `delete_file`               | Delete a file from an adapter file storage — requires *Allow object/file changes*                                                                                                                                                                    |
 | `rename_file`               | Rename/move a file within the same adapter file storage — requires *Allow object/file changes*                                                                                                                                                       |
 | `mkdir`                     | Create a directory in an adapter file storage — requires *Allow object/file changes*                                                                                                                                                                 |
-| `install_package`           | Install an adapter package (npm, GitHub, URL, `.tgz` from the file storage or as base64) on a host and restart its enabled instances — requires *Allow installing packages*, developers only                                                         |
+| `prepare_upload`            | Get a one-time upload link for a file that is too large for a tool argument (e.g. a `.tgz`), for clients that can run shell commands — requires *Allow download/upload links* and *Allow object/file changes* or *Allow installing packages*           |
+| `install_package`           | Install an adapter package (npm, GitHub, URL, `.tgz` from the file storage, as base64 or uploaded via `prepare_upload`) on a host and restart its enabled instances — requires *Allow installing packages*, developers only                            |
 | `start_instance`            | Start (enable) an instance — requires *Allow controlling instances*                                                                                                                                                                                  |
 | `stop_instance`             | Stop (disable) an instance — requires *Allow controlling instances*                                                                                                                                                                                  |
 | `restart_instance`          | Restart a running instance — requires *Allow controlling instances*                                                                                                                                                                                  |
@@ -227,6 +230,25 @@ Every tool declares a JSON input schema and all four MCP behaviour hints (`readO
 `idempotentHint`, `openWorldHint`), so a host can tell what a tool does before calling it and can ask the user
 for confirmation before a writing tool runs. All reading tools are `readOnlyHint: true`; `ping_host` is the only
 tool with `openWorldHint: true`, because it talks to hosts outside of ioBroker.
+
+### Large results and files
+MCP clients reject tool results above 1 MiB, and a model cannot pass megabytes of base64 as a tool argument. So:
+
+- **Every result stays below the limit.** Lists (`get_states`, `search_objects`, `list_files`, `list_scripts`,
+  `history_query`) return as many entries as fit and add `truncated`, `total`, `nextOffset` and a `hint`; call
+  again with `offset` set to `nextOffset` for the next part. `get_logs` keeps the newest lines. Any other result
+  that is too large is replaced by a download link, or by an error asking to narrow the request down.
+- **Download links** (`download_url`): a cut list carries a link to all of its entries as JSON, and `read_file`
+  with `download: true` returns a link to the whole file. Clients that can run shell commands (e.g. Claude Code)
+  fetch it with `curl -o <file> "<download_url>"`.
+- **Upload links**: `prepare_upload` returns a link and an `upload_id`. The client uploads the file with
+  `curl -T <file> "<url>"` (`PUT` or `POST`, raw body, up to 100 MB) and passes the `upload_id` to `write_file` or
+  `install_package`. A link can be used once.
+
+The links are `<mcp endpoint>/transfer/<token>`: the random token is the credential, so they work without the
+login of the MCP endpoint, and they expire after 15 minutes. They are built from the address the client used, or
+from *Public URL*. They are not available in-process (ioBroker.admin) and as a web extension with authentication
+enabled in the web adapter, because the web adapter asks for a login first; the tools then say so.
 
 ### Prompts
 MCP clients offer these as ready-made commands (e.g. as slash commands):
@@ -285,6 +307,10 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Tool results are kept below the 1 MiB limit of MCP clients: lists are paged with `offset`, other results are replaced by a download link
+* (@GermanBluefox) Added download links (`read_file` with `download: true`, complete lists) and upload links (`prepare_upload`, used by `write_file` and `install_package`) for large data (option `transferLinks`)
+
 ### 1.4.0 (2026-10-23)
 * (@GermanBluefox) Added tools to control instances, manage adapters, read/change/run scripts, read and acknowledge notifications, create aliases and send messages to adapters, each behind its own option (off by default)
 * (@GermanBluefox) Added the prompts `diagnose_adapter`, `room_overview` and `create_automation`

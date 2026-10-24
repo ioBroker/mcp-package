@@ -50,6 +50,12 @@ export interface McpConfig {
      * elicitation (default: true).
      */
     confirmDangerous?: boolean;
+    /**
+     * Let tools hand out short-lived download and upload links (`<mcp>/transfer/<token>`) for data that is
+     * too large for a tool result or argument, e.g. a big object list or a .tgz to install (default: true).
+     * Useful for clients that can run shell commands, e.g. Claude Code.
+     */
+    transferLinks?: boolean;
     certPublic: string;
     certPrivate: string;
     certChained: string;
@@ -70,6 +76,7 @@ export type McpPermissions = Pick<
     | 'allowScriptChange'
     | 'sendToAllowlist'
     | 'confirmDangerous'
+    | 'transferLinks'
 >;
 
 /** All keys of {@link McpPermissions}. */
@@ -83,4 +90,5 @@ export const PERMISSION_KEYS: (keyof McpPermissions)[] = [
     'allowScriptChange',
     'sendToAllowlist',
     'confirmDangerous',
+    'transferLinks',
 ];

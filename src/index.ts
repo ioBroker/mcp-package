@@ -1,8 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import net from 'node:net';
 import dns from 'node:dns';
 import fs from 'node:fs';
+import nodePath from 'node:path';
 import type { Server as HttpServer } from 'node:http';
 import type { Server as HttpsServer } from 'node:https';
 import { execFile } from 'node:child_process';
@@ -150,6 +151,69 @@ const DEFAULT_INSTALL_TIMEOUT = 300;
 /** How many output lines of an installation are returned to the client. */
 const INSTALL_OUTPUT_LINES = 100;
 
+/**
+ * Maximum size of a tool result. MCP clients (Claude.ai / Claude Desktop / Claude Code) reject results above
+ * 1 MiB, measured on the JSON-RPC message, in which the result text is escaped once more.
+ */
+const MAX_RESULT_BYTES = 900 * 1024;
+/** How long a download or upload link stays valid (ms). */
+const TRANSFER_TTL = 15 * 60_000;
+/** Largest file that can be uploaded through a link (it travels base64-encoded in a message to the host). */
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+
+/** Size of a text inside the JSON-RPC message, where it is escaped once more. */
+function wireSize(text: string): number {
+    return Buffer.byteLength(JSON.stringify(text));
+}
+
+/** A part of a list that fits into a tool result. */
+interface Page<T> {
+    items: T[];
+    total: number;
+    offset: number;
+    nextOffset?: number;
+    truncated: boolean;
+}
+
+/**
+ * Take the items from `offset` on, as many as fit into a tool result next to the rest of the answer.
+ * With `fromEnd`, the last items are kept instead (the newest log lines).
+ */
+function fitItems<T>(all: T[], offset = 0, fromEnd = false): Page<T> {
+    const budget = MAX_RESULT_BYTES - 16 * 1024;
+    const items = all.slice(offset);
+    let size = 0;
+    let count = 0;
+    while (count < items.length) {
+        const item = items[fromEnd ? items.length - 1 - count : count];
+        size += wireSize(JSON.stringify(item)) + 1;
+        if (size > budget) {
+            break;
+        }
+        count++;
+    }
+    if (count === items.length) {
+        return { items, total: all.length, offset, truncated: false };
+    }
+    return fromEnd
+        ? { items: items.slice(items.length - count), total: all.length, offset, truncated: true }
+        : { items: items.slice(0, count), total: all.length, offset, nextOffset: offset + count, truncated: true };
+}
+
+/** A download or upload link, see `McpServer.createTransfer`. */
+interface Transfer {
+    kind: 'download' | 'upload';
+    /** File name as the client gave or gets it */
+    name: string;
+    /** The temporary file */
+    file: string;
+    contentType: string;
+    /** When the link expires (ms) */
+    expires: number;
+    /** Size in bytes; undefined for an upload link that was not used yet */
+    size?: number;
+}
+
 /** A running `cmdExec` on a host, started by `install_package`. */
 interface CmdSession {
     /** Collected stdout/stderr lines, in the order they arrived */
@@ -241,6 +305,20 @@ export default class McpServer {
     private oauth2?: OAuth2Model;
     /** Installations started by `install_package`, keyed by the `cmdExec` session id. */
     private readonly cmdSessions = new Map<string, CmdSession>();
+    /** Path of the MCP endpoint, e.g. `/mcp`. */
+    private readonly mcpPath: string;
+    /**
+     * Whether tools may hand out download/upload links (`<mcp>/transfer/<token>`). Needs our own HTTP
+     * routes; not as a web extension with authentication, where the web adapter asks for a login first.
+     */
+    private readonly linksAvailable: boolean;
+    /** Why links are not available, for the answer of the tools. */
+    private readonly linksUnavailableReason: string;
+    /** Active download and upload links, keyed by their token. */
+    private readonly transfers = new Map<string, Transfer>();
+    /** Temporary folder for the files of the links, created on first use. */
+    private transferDir?: string;
+    private transferTimer?: NodeJS.Timeout;
 
     constructor(
         server: HttpServer | HttpsServer | null,
@@ -268,6 +346,10 @@ export default class McpServer {
         };
         this.extension = !!instanceSettings;
         this.routerPrefix = this.extension ? `/${WEB_EXTENSION_PREFIX}` : '/';
+        // In standalone mode this is `/mcp`; as a web extension we own the `/<adapter>/` namespace
+        // (e.g. `/mcp/`) within the shared web server, and strip the trailing slash so the route
+        // matches both `/mcp` and `/mcp/` (Express, non-strict).
+        this.mcpPath = this.extension ? this.routerPrefix.replace(/\/$/, '') : '/mcp';
 
         // Determine the ioBroker user whose permissions all MCP requests run with.
         // Prefer this adapter's own setting; when embedded, fall back to the host web server's
@@ -296,6 +378,19 @@ export default class McpServer {
         this.config.sendToAllowlist = (this.config.sendToAllowlist || '').trim();
         // Confirmations via elicitation are on unless turned off explicitly
         this.config.confirmDangerous = this.config.confirmDangerous !== false;
+        this.config.transferLinks = this.config.transferLinks !== false;
+        if (!this.app) {
+            this.linksUnavailableReason = 'Links need the HTTP server of MCP, they are not available in this mode';
+        } else if (!this.config.transferLinks) {
+            this.linksUnavailableReason =
+                'Links are turned off in the MCP adapter settings ("Allow download/upload links")';
+        } else if (this.extension && webSettings.auth) {
+            this.linksUnavailableReason =
+                'Links are not available as a web extension with authentication enabled in the web adapter';
+        } else {
+            this.linksUnavailableReason = '';
+        }
+        this.linksAvailable = !this.linksUnavailableReason;
         // State writes are declared destructive unless turned off explicitly
         this.config.setStateDestructive = this.config.setStateDestructive !== false;
 
@@ -372,10 +467,7 @@ export default class McpServer {
             // Embedded in-process mode: no HTTP transport, so there is nothing to route.
             return;
         }
-        // The MCP endpoint. In standalone mode this is `/mcp`; as a web extension we own the
-        // `/<adapter>/` namespace (e.g. `/mcp/`) within the shared web server. `.replace` strips
-        // the trailing slash so the route matches both `/mcp` and `/mcp/` (Express, non-strict).
-        const mcpPath = this.extension ? this.routerPrefix.replace(/\/$/, '') : '/mcp';
+        const mcpPath = this.mcpPath;
         // The MCP transport needs a parsed JSON body; apply the parser per-route so we never
         // touch the body handling of the web adapter or other extensions when running embedded.
         const jsonParser = express.json({ limit: '4mb' });
@@ -394,7 +486,9 @@ export default class McpServer {
         // As an extension these would collide with the web adapter's own routes.
         if (!this.extension) {
             app.use((req: Request, _res: Response, next: NextFunction) => {
-                this.adapter.log.debug(`${req.method} ${req.url} from ${req.ip}`);
+                // The token of a transfer link is a credential, so it does not go into the log
+                const url = req.url.replace(/\/transfer\/[^/?]+/, '/transfer/***');
+                this.adapter.log.debug(`${req.method} ${url} from ${req.ip}`);
                 next();
             });
 
@@ -505,6 +599,19 @@ export default class McpServer {
         app.delete(mcpPath, ...guards, (req: Request, res: Response) => {
             void this.handleMcpSessionRequest(req, res);
         });
+
+        // --- Download and upload links (see createTransfer) ---
+        // No guards: the random token in the path is the credential. An authenticated MCP session got
+        // it from a tool and hands it to a program without MCP access, e.g. curl in a shell.
+        if (this.linksAvailable) {
+            app.get(`${mcpPath}/transfer/:token`, (req: Request, res: Response) => this.handleDownload(req, res));
+            app.put(`${mcpPath}/transfer/:token`, (req: Request, res: Response) => {
+                void this.handleUpload(req, res);
+            });
+            app.post(`${mcpPath}/transfer/:token`, (req: Request, res: Response) => {
+                void this.handleUpload(req, res);
+            });
+        }
 
         // Catch-all 404 + error handlers only in standalone mode; the web adapter provides its own.
         if (!this.extension) {
@@ -693,7 +800,7 @@ export default class McpServer {
             }
 
             const subscriptions = new Set<string>();
-            const server = this.createServer(subscriptions);
+            const server = this.createServer(subscriptions, this.getBaseUrl(req));
 
             transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: () => randomUUID(),
@@ -886,19 +993,76 @@ export default class McpServer {
      * Create a new MCP SDK server with all ioBroker tools registered.
      *
      * @param subscriptions the per-session set of subscribed state ids (mutated by subscribe/unsubscribe)
+     * @param baseUrl public address of this server, for download/upload links (none in-process)
      */
-    private createServer(subscriptions: Set<string>): McpSdkServer {
+    private createServer(subscriptions: Set<string>, baseUrl?: string): McpSdkServer {
         const server = new McpSdkServer(
             { name: SERVER_NAME, version: SERVER_VERSION },
             { capabilities: { tools: {}, resources: { subscribe: true } } },
         );
 
-        const ok = (data: unknown): ToolResult => ({ content: [{ type: 'text', text: JSON.stringify(data) }] });
         const fail = (error: unknown): ToolResult => {
             const message = error instanceof Error ? error.message : String(error);
             this.adapter.log.warn(`MCP tool error: ${message}`);
             return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: message }) }], isError: true };
         };
+        const canLink = this.linksAvailable && !!baseUrl;
+        // A download link for data that is too large for a tool result
+        const download = (name: string, data: string | Buffer, contentType: string): Record<string, unknown> => ({
+            download_url: this.transferUrl(baseUrl!, this.createTransfer('download', name, data, contentType)),
+            expires_in: TRANSFER_TTL / 1000,
+        });
+        const linkHint = 'fetch it with e.g. `curl -o <file> "<download_url>"` if you can run shell commands';
+        // Clients reject results above 1 MiB without telling the server, so never send one
+        const ok = (data: unknown): ToolResult => {
+            const text = JSON.stringify(data);
+            if (wireSize(text) <= MAX_RESULT_BYTES) {
+                return { content: [{ type: 'text', text }] };
+            }
+            const size = `${Math.round(Buffer.byteLength(text) / 1024)} KB`;
+            if (canLink) {
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: JSON.stringify({
+                                ok: true,
+                                too_large: true,
+                                size,
+                                ...download('result.json', text, 'application/json'),
+                                hint: `The result (${size}) is too large for one answer: narrow the request down, or ${linkHint}`,
+                            }),
+                        },
+                    ],
+                };
+            }
+            return fail(
+                new Error(
+                    `The result (${size}) is larger than ${MAX_RESULT_BYTES / 1024} KB, which MCP clients accept. ` +
+                        'Narrow the request down (filters, wildcards, time range) or use offset/limit.',
+                ),
+            );
+        };
+        // Describe a cut list: how to get the rest, and a link to all of it (if it was cut for its size)
+        const pageInfo = <T>(page: Page<T>, all: T[], name: string, link = true): Record<string, unknown> => {
+            if (!page.truncated) {
+                return {};
+            }
+            const info: Record<string, unknown> = { truncated: true, total: page.total };
+            const ways: string[] = [];
+            if (page.nextOffset !== undefined) {
+                info.nextOffset = page.nextOffset;
+                ways.push('call again with offset=nextOffset');
+            }
+            ways.push('narrow the request down');
+            if (canLink && link) {
+                Object.assign(info, download(name, JSON.stringify(all), 'application/json'));
+                ways.push(`get all ${all.length} entries from download_url: ${linkHint}`);
+            }
+            info.hint = `${link ? 'Not everything fits into one answer' : 'There are more entries'}: ${ways.join(', or ')}`;
+            return info;
+        };
+        const offsetSchema = z.number().int().min(0).optional().describe('Skip this many entries (for paging)');
         // Ask the user before a dangerous action, if the client can (MCP elicitation). Clients without
         // elicitation rely on the destructiveHint of the tool instead.
         const confirm = async (message: string): Promise<void> => {
@@ -926,11 +1090,16 @@ export default class McpServer {
                 description:
                     'Retrieve the current value of one or multiple states. IDs may contain wildcards, ' +
                     'e.g. "hue.0.*.brightness" expands to all matching states.',
-                inputSchema: { ids: z.array(z.string()).describe('Array of state IDs (wildcards "*" allowed)') },
+                inputSchema: {
+                    ids: z.array(z.string()).describe('Array of state IDs (wildcards "*" allowed)'),
+                    offset: offsetSchema,
+                },
             },
-            async ({ ids }) => {
+            async ({ ids, offset }) => {
                 try {
-                    return ok({ ok: true, data: { states: await this.getStates(ids) } });
+                    const states = await this.getStates(ids);
+                    const page = fitItems(states, offset);
+                    return ok({ ok: true, data: { states: page.items, ...pageInfo(page, states, 'states.json') } });
                 } catch (e) {
                     return fail(e);
                 }
@@ -1029,7 +1198,10 @@ export default class McpServer {
             },
             async args => {
                 try {
-                    return ok({ ok: true, data: { logs: await this.getLogs(args) } });
+                    // Keep the newest lines if not all of them fit
+                    const logs = await this.getLogs(args);
+                    const page = fitItems(logs, 0, true);
+                    return ok({ ok: true, data: { logs: page.items, ...pageInfo(page, logs, 'logs.json') } });
                 } catch (e) {
                     return fail(e);
                 }
@@ -1100,12 +1272,24 @@ export default class McpServer {
                     role: z.string().optional(),
                     room: z.string().optional(),
                     adapter: z.string().optional().describe('Filter by source adapter instance, e.g. "hue.0"'),
-                    limit: z.number().int().optional().describe('Maximum number of results (default 50)'),
+                    limit: z.number().int().min(1).optional().describe('Maximum number of results (default 50)'),
+                    offset: offsetSchema,
                 },
             },
-            async args => {
+            async ({ limit = 50, offset = 0, ...filters }) => {
                 try {
-                    return ok({ ok: true, data: { results: await this.searchObjects(args) } });
+                    const matches = await this.searchObjects(filters);
+                    const page = fitItems(matches.slice(0, offset + limit), offset);
+                    const tooLarge = page.truncated;
+                    if (!page.truncated && matches.length > offset + limit) {
+                        page.truncated = true;
+                        page.nextOffset = offset + limit;
+                    }
+                    page.total = matches.length;
+                    return ok({
+                        ok: true,
+                        data: { results: page.items, ...pageInfo(page, matches, 'objects.json', tooLarge) },
+                    });
                 } catch (e) {
                     return fail(e);
                 }
@@ -1176,11 +1360,17 @@ export default class McpServer {
                         .describe('Quantile (0-1), only used with agg=quantile'),
                     interval: z.string().optional().describe('Aggregation interval, e.g. 15m, 1h'),
                     limit: z.number().int().optional().describe('Maximum number of values (default 1000)'),
+                    offset: offsetSchema,
                 },
             },
-            async args => {
+            async ({ offset, ...args }) => {
                 try {
-                    return ok({ ok: true, data: await this.historyQuery(args) });
+                    const result = await this.historyQuery(args);
+                    const page = fitItems(result.values, offset);
+                    return ok({
+                        ok: true,
+                        data: { ...result, values: page.items, ...pageInfo(page, result.values, 'history.json') },
+                    });
                 } catch (e) {
                     return fail(e);
                 }
@@ -1355,7 +1545,8 @@ export default class McpServer {
                     `At most \`length\` bytes (default ${DEFAULT_MAX_READ_BYTES}) are returned per call; ` +
                     'large files are read in chunks: when the result has `truncated: true`, call again with ' +
                     '`offset` set to the returned `nextOffset` until `truncated` is false. ' +
-                    '`size` is the total file size in bytes.',
+                    '`size` is the total file size in bytes. If you can run shell commands (e.g. Claude Code), ' +
+                    'set `download: true` instead to get a link to the whole file, which you fetch with curl.',
                 inputSchema: {
                     path: z.string().describe('Path as "<adapter>/<dir>/<file>"'),
                     base64: z.boolean().optional().describe('Return binary content base64-encoded'),
@@ -1371,10 +1562,35 @@ export default class McpServer {
                         .min(1)
                         .optional()
                         .describe(`Maximum number of bytes to return (default ${DEFAULT_MAX_READ_BYTES})`),
+                    download: z
+                        .boolean()
+                        .optional()
+                        .describe('Return a download link to the whole file instead of its content'),
                 },
             },
-            async ({ path, base64, offset, length }) => {
+            async ({ path, base64, offset, length, download: asLink }) => {
                 try {
+                    if (asLink) {
+                        if (!canLink) {
+                            throw new Error(this.linksUnavailableReason || 'Links are not available');
+                        }
+                        const { adapterName, fileName } = McpServer.parseFilePath(path);
+                        const file = await this.adapter.readFileAsync(adapterName, fileName, {
+                            user: this.defaultUser,
+                        });
+                        const data = Buffer.isBuffer(file.file) ? file.file : Buffer.from(file.file || '');
+                        const mimeType = file.mimeType || 'application/octet-stream';
+                        return ok({
+                            ok: true,
+                            data: {
+                                path,
+                                size: data.length,
+                                mimeType,
+                                ...download(fileName.split('/').pop() || 'file', data, mimeType),
+                                hint: linkHint,
+                            },
+                        });
+                    }
                     return ok({ ok: true, data: await this.readFile(path, base64, offset, length) });
                 } catch (e) {
                     return fail(e);
@@ -1388,11 +1604,13 @@ export default class McpServer {
                 title: 'List a directory',
                 annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                 description: 'List a directory in an adapter file storage, e.g. "vis-2.0/main" or "0_userdata.0"',
-                inputSchema: { path: z.string().describe('Path as "<adapter>[/<dir>]"') },
+                inputSchema: { path: z.string().describe('Path as "<adapter>[/<dir>]"'), offset: offsetSchema },
             },
-            async ({ path }) => {
+            async ({ path, offset }) => {
                 try {
-                    return ok({ ok: true, data: { path, files: await this.listFiles(path) } });
+                    const files = await this.listFiles(path);
+                    const page = fitItems(files, offset);
+                    return ok({ ok: true, data: { path, files: page.items, ...pageInfo(page, files, 'files.json') } });
                 } catch (e) {
                     return fail(e);
                 }
@@ -1639,16 +1857,32 @@ export default class McpServer {
                         idempotentHint: true,
                         openWorldHint: false,
                     },
-                    description: 'Write a file to an adapter file storage, e.g. "vis-2.0/main/vis-views.json"',
+                    description:
+                        'Write a file to an adapter file storage, e.g. "vis-2.0/main/vis-views.json". Give the ' +
+                        'content, or - for a large file, if you can run shell commands - upload it with ' +
+                        'prepare_upload and give its upload_id.',
                     inputSchema: {
                         path: z.string().describe('Path as "<adapter>/<dir>/<file>"'),
-                        content: z.string().describe('File content (UTF-8, or base64 when base64=true)'),
+                        content: z.string().optional().describe('File content (UTF-8, or base64 when base64=true)'),
                         base64: z.boolean().optional().describe('Treat content as base64-encoded binary'),
+                        upload_id: z.string().optional().describe('Id of a file uploaded via prepare_upload'),
                     },
                 },
-                async ({ path, content, base64 }) => {
+                async ({ path, content, base64, upload_id }) => {
                     try {
-                        await this.writeFile(path, content, base64);
+                        if ((content === undefined) === (upload_id === undefined)) {
+                            throw new Error('Give either "content" or "upload_id"');
+                        }
+                        if (upload_id !== undefined) {
+                            const upload = this.getUpload(upload_id);
+                            const { adapterName, fileName } = McpServer.parseFilePath(path);
+                            await this.adapter.writeFileAsync(adapterName, fileName, fs.readFileSync(upload.file), {
+                                user: this.defaultUser,
+                            });
+                            this.removeTransfer(upload_id);
+                            return ok({ ok: true, data: { path, size: upload.size } });
+                        }
+                        await this.writeFile(path, content!, base64);
                         return ok({ ok: true, data: { path } });
                     } catch (e) {
                         return fail(e);
@@ -1790,11 +2024,17 @@ export default class McpServer {
                     'id, name, type, whether they run, and the javascript instance - without the source.',
                 inputSchema: {
                     folder: z.string().optional().describe('Only scripts in this folder, e.g. "common" or "lights"'),
+                    offset: offsetSchema,
                 },
             },
-            async ({ folder }) => {
+            async ({ folder, offset }) => {
                 try {
-                    return ok({ ok: true, data: { scripts: await this.listScripts(folder) } });
+                    const scripts = await this.listScripts(folder);
+                    const page = fitItems(scripts, offset);
+                    return ok({
+                        ok: true,
+                        data: { scripts: page.items, ...pageInfo(page, scripts, 'scripts.json') },
+                    });
                 } catch (e) {
                     return fail(e);
                 }
@@ -2056,6 +2296,51 @@ export default class McpServer {
             );
         }
 
+        // Large files cannot pass through the model: the client uploads them with a separate program
+        if (canLink && (this.config.allowObjectChange || this.config.allowPackageInstall)) {
+            server.registerTool(
+                'prepare_upload',
+                {
+                    title: 'Prepare a file upload',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: false,
+                        idempotentHint: false,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Get a one-time link to upload a file that is too large for a tool argument, e.g. a .tgz ' +
+                        'for install_package or a big file for write_file. Only useful if you can run shell ' +
+                        'commands (e.g. Claude Code): upload the local file with `curl -T <file> "<url>"`, then ' +
+                        `pass the returned upload_id to install_package or write_file. Valid for ${TRANSFER_TTL / 60_000} minutes, ` +
+                        `up to ${MAX_UPLOAD_BYTES / 1024 / 1024} MB.`,
+                    inputSchema: {
+                        name: z.string().describe('File name, e.g. "iobroker.hue-3.9.1.tgz"'),
+                    },
+                },
+                ({ name }) => {
+                    try {
+                        const token = this.createTransfer('upload', name);
+                        const url = this.transferUrl(baseUrl, token);
+                        return Promise.resolve(
+                            ok({
+                                ok: true,
+                                data: {
+                                    upload_id: token,
+                                    url,
+                                    method: 'PUT',
+                                    expires_in: TRANSFER_TTL / 1000,
+                                    command: `curl -T "${name}" "${url}"`,
+                                },
+                            }),
+                        );
+                    } catch (e) {
+                        return Promise.resolve(fail(e));
+                    }
+                },
+            );
+        }
+
         // Installing packages runs arbitrary code on the host, so it is a separate opt-in for developers.
         if (this.config.allowPackageInstall) {
             server.registerTool(
@@ -2074,7 +2359,8 @@ export default class McpServer {
                         'package ("iobroker.hue@3.9.0" or just "hue"), a GitHub repository ' +
                         '("ioBroker/ioBroker.hue#main" or https URL), an https URL of a .tgz or a .tgz path on the ' +
                         'target host; `file_path` - a .tgz in the ioBroker file storage ("0_userdata.0/x.tgz"); or ' +
-                        '`file_name` + `file_content` - a small .tgz as base64. Waits until the installation is ' +
+                        '`file_name` + `file_content` - a small .tgz as base64; or `upload_id` - a .tgz uploaded ' +
+                        'via prepare_upload (for large files, if you can run shell commands). Waits until the installation is ' +
                         'finished (or `timeout`), returns the exit code and the last output lines. Enabled instances ' +
                         'of the adapter are restarted afterwards; no new instance is created.',
                     inputSchema: {
@@ -2091,6 +2377,7 @@ export default class McpServer {
                             .optional()
                             .describe('File name of the .tgz in file_content, e.g. "iobroker.hue-3.9.0.tgz"'),
                         file_content: z.string().optional().describe('The .tgz file as base64'),
+                        upload_id: z.string().optional().describe('Id of a .tgz uploaded via prepare_upload'),
                         host: z.string().optional().describe('Target host (default: the host of this instance)'),
                         debug: z.boolean().optional().describe('Install with --debug for more output'),
                         restart_instances: z
@@ -2111,7 +2398,7 @@ export default class McpServer {
                 async args => {
                     try {
                         await confirm(
-                            `Install the package "${args.source || args.file_path || args.file_name}"? It runs with full rights on the host.`,
+                            `Install the package "${args.source || args.file_path || args.file_name || args.upload_id}"? It runs with full rights on the host.`,
                         );
                         return ok({ ok: true, data: await this.installPackage(args) });
                     } catch (e) {
@@ -2914,9 +3201,8 @@ export default class McpServer {
         role?: string;
         room?: string;
         adapter?: string;
-        limit?: number;
     }): Promise<Record<string, unknown>[]> {
-        const { query = '', type, role, room, adapter, limit = 50 } = params;
+        const { query = '', type, role, room, adapter } = params;
         const result = await this.adapter.getObjectListAsync(
             {
                 startkey: '',
@@ -2955,9 +3241,6 @@ export default class McpServer {
                 name,
                 adapter: sourceAdapter,
             });
-            if (results.length >= limit) {
-                break;
-            }
         }
         return results;
     }
@@ -2981,7 +3264,7 @@ export default class McpServer {
         quantile?: number;
         interval?: string;
         limit?: number;
-    }): Promise<Record<string, unknown>> {
+    }): Promise<{ id: string; values: unknown[] } & Record<string, unknown>> {
         const options: ioBroker.GetHistoryOptions = {
             aggregate: AGG_MAP[params.agg || 'raw'] || 'none',
             count: params.limit ?? 1000,
@@ -3518,16 +3801,26 @@ export default class McpServer {
         file_path?: string;
         file_name?: string;
         file_content?: string;
+        upload_id?: string;
         host?: string;
         debug?: boolean;
         restart_instances?: boolean;
         timeout?: number;
     }): Promise<Record<string, unknown>> {
-        const given = [params.source, params.file_path, params.file_content].filter(one => one !== undefined);
+        const given = [params.source, params.file_path, params.file_content, params.upload_id].filter(
+            one => one !== undefined,
+        );
         if (given.length !== 1) {
-            throw new Error('Give exactly one of "source", "file_path" or "file_name" + "file_content"');
+            throw new Error('Give exactly one of "source", "file_path", "file_name" + "file_content" or "upload_id"');
         }
         const host = await this.resolveHost(params.host);
+        let upload: Transfer | undefined;
+        if (params.upload_id !== undefined) {
+            upload = this.getUpload(params.upload_id);
+            if (!upload.name.toLowerCase().endsWith('.tgz')) {
+                throw new Error('Only .tgz files can be installed');
+            }
+        }
 
         let source: string;
         let files: { name: string; file: string }[] | undefined;
@@ -3549,6 +3842,9 @@ export default class McpServer {
                 const result = await this.adapter.readFileAsync(adapterName, storageName, { user: this.defaultUser });
                 data = Buffer.isBuffer(result.file) ? result.file : Buffer.from(result.file || '');
                 fileName = storageName.split('/').pop() || '';
+            } else if (upload) {
+                data = fs.readFileSync(upload.file);
+                fileName = upload.name;
             } else {
                 if (!params.file_name) {
                     throw new Error('"file_content" requires "file_name"');
@@ -3576,7 +3872,12 @@ export default class McpServer {
             params.timeout,
             files,
         );
-        const adapterName = extractAdapterName(params.file_path || params.file_name || params.source || '');
+        if (upload && result.finished) {
+            this.removeTransfer(params.upload_id!);
+        }
+        const adapterName = extractAdapterName(
+            params.file_path || params.file_name || upload?.name || params.source || '',
+        );
         const restarted =
             result.success && adapterName && params.restart_instances !== false
                 ? await this.restartAdapterInstances(adapterName)
@@ -4145,6 +4446,152 @@ export default class McpServer {
         return { id, target: params.target, ...(params.write_target ? { write_target: params.write_target } : {}) };
     }
 
+    /**
+     * Create a download link for `data`, or an upload link when `data` is undefined, and return its
+     * token. The file lives in a temporary folder until the link expires (or the upload is used).
+     */
+    private createTransfer(
+        kind: Transfer['kind'],
+        name: string,
+        data?: string | Buffer,
+        contentType = 'application/octet-stream',
+    ): string {
+        this.cleanupTransfers();
+        if (!this.transferDir) {
+            this.transferDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'iobroker-mcp-'));
+            this.transferTimer = setInterval(() => this.cleanupTransfers(), 60_000);
+            this.transferTimer.unref?.();
+        }
+        const token = randomBytes(32).toString('hex');
+        // One folder per link, so the file keeps its name (`npm` needs the .tgz extension)
+        const folder = nodePath.join(this.transferDir, token);
+        fs.mkdirSync(folder);
+        const file = nodePath.join(folder, name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'file');
+        if (data !== undefined) {
+            fs.writeFileSync(file, data);
+        }
+        this.transfers.set(token, {
+            kind,
+            name,
+            file,
+            contentType,
+            expires: Date.now() + TRANSFER_TTL,
+            size: data !== undefined ? Buffer.byteLength(data) : undefined,
+        });
+        return token;
+    }
+
+    /** The public URL of a download or upload link. */
+    private transferUrl(baseUrl: string, token: string): string {
+        return `${baseUrl}${this.mcpPath}/transfer/${token}`;
+    }
+
+    /** Remove a link and its file. */
+    private removeTransfer(token: string): void {
+        const transfer = this.transfers.get(token);
+        if (transfer) {
+            this.transfers.delete(token);
+            try {
+                fs.rmSync(nodePath.dirname(transfer.file), { recursive: true, force: true });
+            } catch (e) {
+                this.adapter.log.warn(`Cannot delete "${transfer.file}": ${e}`);
+            }
+        }
+    }
+
+    /** Remove the expired links. */
+    private cleanupTransfers(): void {
+        const now = Date.now();
+        for (const [token, transfer] of this.transfers) {
+            if (transfer.expires < now) {
+                this.removeTransfer(token);
+            }
+        }
+    }
+
+    /** `GET <mcp>/transfer/<token>`: send the file of a download link. */
+    private handleDownload(req: Request, res: Response): void {
+        const transfer = this.transfers.get(String(req.params.token));
+        if (!transfer || transfer.kind !== 'download' || transfer.expires < Date.now()) {
+            res.status(404).json({ error: 'Unknown or expired link' });
+            return;
+        }
+        res.setHeader('Content-Type', transfer.contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${nodePath.basename(transfer.file)}"`);
+        if (transfer.size !== undefined) {
+            res.setHeader('Content-Length', transfer.size);
+        }
+        fs.createReadStream(transfer.file).pipe(res);
+    }
+
+    /** `PUT`/`POST <mcp>/transfer/<token>`: receive the file of an upload link (raw body, e.g. `curl -T`). */
+    private async handleUpload(req: Request, res: Response): Promise<void> {
+        const token = String(req.params.token);
+        const transfer = this.transfers.get(token);
+        if (!transfer || transfer.kind !== 'upload' || transfer.expires < Date.now()) {
+            res.status(404).json({ error: 'Unknown or expired link' });
+            return;
+        }
+        if (transfer.size !== undefined) {
+            res.status(409).json({ error: 'This link was already used' });
+            return;
+        }
+        try {
+            transfer.size = await McpServer.receiveBody(req, transfer.file);
+            this.adapter.log.info(`Received upload "${transfer.name}" (${transfer.size} bytes)`);
+            res.json({ ok: true, upload_id: token, name: transfer.name, size: transfer.size });
+        } catch (e) {
+            const error = e as Error & { status?: number };
+            fs.rmSync(transfer.file, { force: true });
+            res.status(error.status || 400).json({ error: error.message });
+        }
+    }
+
+    /** Write the raw body of a request to a file and return its size. */
+    private static receiveBody(req: Request, file: string): Promise<number> {
+        const tooLarge = (): Error =>
+            Object.assign(new Error(`The file is larger than ${MAX_UPLOAD_BYTES / 1024 / 1024} MB`), { status: 413 });
+
+        // The body parsers of the web adapter may have read the stream already and kept the bytes
+        const read = (req as Request & { rawBody?: Buffer }).rawBody ?? (Buffer.isBuffer(req.body) ? req.body : null);
+        if (read) {
+            if (read.length > MAX_UPLOAD_BYTES) {
+                return Promise.reject(tooLarge());
+            }
+            fs.writeFileSync(file, read);
+            return Promise.resolve(read.length);
+        }
+
+        return new Promise((resolve, reject) => {
+            const out = fs.createWriteStream(file);
+            let size = 0;
+            req.on('data', (chunk: Buffer) => {
+                size += chunk.length;
+                if (size > MAX_UPLOAD_BYTES) {
+                    req.unpipe(out);
+                    out.destroy();
+                    reject(tooLarge());
+                }
+            });
+            req.on('error', reject);
+            out.on('error', reject);
+            out.on('finish', () => resolve(size));
+            req.pipe(out);
+        });
+    }
+
+    /** Get a received upload by its id, failing if it is unknown, expired or still empty. */
+    private getUpload(uploadId: string): Transfer {
+        const transfer = this.transfers.get(uploadId);
+        if (!transfer || transfer.kind !== 'upload' || transfer.expires < Date.now()) {
+            throw new Error(`Unknown or expired upload "${uploadId}" - create a new one with prepare_upload`);
+        }
+        if (transfer.size === undefined) {
+            throw new Error(`Nothing was uploaded to "${uploadId}" yet - upload the file to its url first`);
+        }
+        return transfer;
+    }
+
     // --- helpers ---
 
     /** Resolve the member ids of a room/function enum matched by id or (localized) name. */
@@ -4187,6 +4634,15 @@ export default class McpServer {
             this.adapter.removeListener('message', this.onMessage);
         } catch {
             // ignore
+        }
+        if (this.transferTimer) {
+            clearInterval(this.transferTimer);
+            this.transferTimer = undefined;
+        }
+        if (this.transferDir) {
+            fs.rmSync(this.transferDir, { recursive: true, force: true });
+            this.transferDir = undefined;
+            this.transfers.clear();
         }
         for (const session of Object.values(this.sessions)) {
             try {
