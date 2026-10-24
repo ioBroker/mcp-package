@@ -310,7 +310,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.6.1 (2026-10-24)
 * (@GermanBluefox) An upload can only be used by the user that created it with `prepare_upload`
 
 ### 1.6.0 (2026-10-24)
