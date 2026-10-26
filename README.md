@@ -311,7 +311,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.7.1 (2026-10-26)
 * (@GermanBluefox) Fixed: `get_logs` always returned `size: null` for the log file, because the host sends the size as a string
 
 ### 1.7.0 (2026-10-26)
