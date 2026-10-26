@@ -162,13 +162,17 @@ function createMockAdapter() {
     const files = defaultFiles();
     /** Every log line the tools wrote, as `{ level, message }`. */
     const logged = [];
-    /** Raw log lines the host returns for `sendToHost('getLogs')`. */
+    /**
+     * Raw log lines the host returns for `sendToHost('getLogs')`. Like js-controller: the file ends with a
+     * newline (empty last line), followed by the file size as a string.
+     */
     const hostLogs = [
         '2026-06-12 11:46:39.802  - error: hm-rpc.0 (1234) Init not possible',
         '2026-06-12 11:46:40.100  - warn: hue.0 (1235) Bridge answered slowly',
         '2026-06-12 11:46:41.500  - info: admin.0 (1236) Server listening on port 8081',
         '2026-06-12 11:46:42.000  - debug: hue.0 (1235) Polling',
-        4096,
+        '',
+        '4096',
     ];
     /**
      * `cmdExec` messages sent to a host (`install_package`), and how the simulated host answers:

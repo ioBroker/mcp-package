@@ -311,6 +311,9 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Fixed: `get_logs` always returned `size: null` for the log file, because the host sends the size as a string
+
 ### 1.7.0 (2026-10-26)
 * (@GermanBluefox) A confirmation that the client dismissed without an answer is no longer reported as "Cancelled by the user", but explains how to turn off the confirmations for clients that cannot show them
 * (@GermanBluefox) `get_states` returns `exists: false` for an unknown ID instead of a `null` value with the current time

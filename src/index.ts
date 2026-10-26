@@ -3187,9 +3187,15 @@ export default class McpServer {
                 }
                 let logs = this.parseLogLines(rawList);
                 const newestTs = logs.length ? logs[logs.length - 1].ts : undefined;
-                // The host appends the size of the log file as the last element
+                // The host appends the size of the log file as the last element: as a string after reading
+                // the file, as a number only if reading failed
                 const last = rawList[rawList.length - 1];
-                const fileSize = typeof last === 'number' ? last : undefined;
+                const fileSize =
+                    typeof last === 'number'
+                        ? last
+                        : typeof last === 'string' && /^\d+$/.test(last)
+                          ? Number(last)
+                          : undefined;
                 if (params.level && params.level.length) {
                     logs = logs.filter(log => params.level!.includes(log.level));
                 }
