@@ -12,6 +12,7 @@ const { startMcp, startMcpWithDefaults } = require('./helpers');
 /** Every tool the server registers when all permission toggles are on. */
 const ALL_TOOLS = [
     'add_instance',
+    'check_permissions',
     'clear_notifications',
     'create_alias',
     'create_scene',
@@ -111,6 +112,7 @@ const READ_ONLY_TOOLS = [
     'list_rooms',
     'list_functions',
     'get_object',
+    'check_permissions',
     'read_file',
     'list_files',
     'file_exists',

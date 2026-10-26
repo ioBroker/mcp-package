@@ -6,6 +6,16 @@ const assert = require('node:assert/strict');
 const net = require('node:net');
 const { startMcp, call, callOk } = require('./helpers');
 
+/** Format a time like js-controller does in the log file (local time). */
+function logTime(ts) {
+    const date = new Date(ts);
+    const pad = (value, length = 2) => String(value).padStart(length, '0');
+    return (
+        `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+        `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`
+    );
+}
+
 describe('reading tools', () => {
     let ctx;
 
@@ -34,6 +44,17 @@ describe('reading tools', () => {
         const data = await callOk(ctx.mcp, 'get_states', { ids: ['does.not.0.exist'] });
         assert.equal(data.states.length, 1);
         assert.equal(data.states[0].value, null);
+        assert.equal(data.states[0].exists, false);
+        assert.equal(data.states[0].ts, undefined, 'no made-up timestamp for a missing state');
+    });
+
+    it('get_states tells an object without a value from a missing one', async () => {
+        delete ctx.states['hue.0.light.state'];
+        const data = await callOk(ctx.mcp, 'get_states', { ids: ['hue.0.light.state', 'hue.0.light'] });
+        assert.equal(data.states[0].exists, true);
+        assert.match(data.states[0].hint, /no value yet/);
+        assert.equal(data.states[1].exists, true);
+        assert.match(data.states[1].hint, /channel object, not a state/);
     });
 
     it('get_object reads an object and returns null for a missing one', async () => {
@@ -55,6 +76,18 @@ describe('reading tools', () => {
         const errors = await callOk(ctx.mcp, 'get_logs', { level: ['error'] });
         assert.equal(errors.logs.length, 1);
         assert.equal(errors.logs[0].level, 'error');
+    });
+
+    it('get_logs reports the newest line and the size of the log file', async () => {
+        const data = await callOk(ctx.mcp, 'get_logs', { level: ['error'] });
+        assert.equal(data.logFile.size, 4096);
+        // the newest line of the whole file, not of the filtered result
+        assert.equal(data.logFile.newestLineTs, new Date('2026-06-12T11:46:42.000').getTime());
+        assert.match(data.logFile.hint, /minutes old/);
+
+        ctx.hostLogs.splice(-1, 0, `${logTime(Date.now())}  - info: hue.0 (1235) Fresh`);
+        const fresh = await callOk(ctx.mcp, 'get_logs', {});
+        assert.equal(fresh.logFile.hint, undefined);
     });
 
     it('get_logs filters by adapter', async () => {
@@ -589,6 +622,39 @@ describe('set_states permissions', () => {
         await callOk(ctx.mcp, 'set_states', { states: [{ id: 'hue.0.light.brightness', value: 10 }] });
         assert.equal(ctx.states['hue.0.light.brightness'].val, 10);
     });
+
+    it('check_permissions reports the rights of the user on objects', async () => {
+        const data = await callOk(ctx.mcp, 'check_permissions', {
+            ids: ['hue.0.light.state', 'hue.0.light.brightness', 'hue.0.light', 'nope.0.missing'],
+        });
+        assert.equal(data.user, user);
+        assert.deepEqual(data.groups, ['system.group.mcp']);
+        assert.equal(data.admin, false);
+        assert.equal(data.rights.state.write, true);
+        const [own, foreign, channel, missing] = data.objects;
+        assert.deepEqual(own.object, { read: true, write: false, delete: false });
+        assert.deepEqual(own.state, { read: true, write: true });
+        assert.equal(own.acl.ownerGroup, 'system.group.mcp');
+        assert.deepEqual(foreign.state, { read: true, write: false });
+        assert.equal(channel.state, undefined);
+        assert.equal(channel.object.read, true);
+        assert.deepEqual(missing, { id: 'nope.0.missing', exists: false });
+    });
+
+    it('check_permissions hides the ACL of objects the user may not read', async () => {
+        ctx.objects['hue.0.light.brightness'].acl.object = 0x660;
+        const data = await callOk(ctx.mcp, 'check_permissions', { ids: ['hue.0.light.brightness'] });
+        assert.equal(data.objects[0].object.read, false);
+        assert.equal(data.objects[0].acl, undefined);
+    });
+
+    it('check_permissions grants everything to administrators', async () => {
+        ctx.permissions[user].groups.push('system.group.administrator');
+        const data = await callOk(ctx.mcp, 'check_permissions', { ids: ['hue.0.light.brightness'] });
+        assert.equal(data.admin, true);
+        assert.deepEqual(data.objects[0].object, { read: true, write: true, delete: true });
+        assert.deepEqual(data.objects[0].state, { read: true, write: true });
+    });
 });
 
 describe('ping_host', () => {
@@ -701,7 +767,7 @@ describe('install_package', () => {
             common: { name: 'hue', enabled: true },
             native: {},
         };
-        const data = await callOk(ctx.mcp, 'install_package', { source: 'hue' });
+        const data = await callOk(ctx.mcp, 'install_package', { source: 'hue', start_timeout: 1 });
         assert.equal(ctx.cmdExec.sent.length, 1);
         assert.equal(ctx.cmdExec.sent[0].host, 'system.host.testhost');
         assert.equal(ctx.cmdExec.sent[0].data, 'url iobroker.hue --host testhost');
@@ -711,6 +777,41 @@ describe('install_package', () => {
         assert.deepEqual(data.restartedInstances, ['hue.0']);
         assert.deepEqual(ctx.extended, ['system.adapter.hue.0']);
         assert.deepEqual(data.output, ['install url iobroker.hue --host testhost']);
+        assert.equal(data.instances[0].id, 'hue.0');
+        assert.equal(data.instances[0].alive, false);
+    });
+
+    it('reports whether the restarted instances came up and their first log lines', async () => {
+        ctx.objects['system.adapter.hue.0'] = {
+            _id: 'system.adapter.hue.0',
+            type: 'instance',
+            common: { name: 'hue', enabled: true, mode: 'daemon' },
+            native: {},
+        };
+        ctx.objects['system.adapter.hue.1'] = {
+            _id: 'system.adapter.hue.1',
+            type: 'instance',
+            common: { name: 'hue', enabled: true, mode: 'schedule' },
+            native: {},
+        };
+        // the heartbeat of the old process refreshes ts, but not lc
+        ctx.states['system.adapter.hue.0.alive'] = { val: true, ack: true, ts: Date.now() + 10_000, lc: 1 };
+        const extend = ctx.adapter.extendForeignObjectAsync;
+        ctx.adapter.extendForeignObjectAsync = async (id, obj) => {
+            const result = await extend(id, obj);
+            setTimeout(() => {
+                const now = Date.now();
+                ctx.states[`${id}.alive`] = { val: true, ack: true, ts: now, lc: now };
+                ctx.hostLogs.splice(-1, 0, `${logTime(now)}  - info: hue.0 (1240) starting. Version 3.9.1`);
+            }, 700);
+            return result;
+        };
+        const data = await callOk(ctx.mcp, 'install_package', { source: 'hue', start_timeout: 5 });
+        assert.deepEqual(data.restartedInstances, ['hue.0', 'hue.1']);
+        assert.equal(data.instances[0].alive, true);
+        assert.match(data.instances[0].logs[0].message, /starting\. Version 3\.9\.1/);
+        assert.equal(data.instances[1].mode, 'schedule');
+        assert.equal(data.instances[1].alive, undefined);
     });
 
     it('sends a .tgz from the file storage along with the command', async () => {
@@ -1145,6 +1246,19 @@ describe('prompts and confirmations', () => {
         }
     });
 
+    it('explains a dismissed confirmation instead of blaming the user', async () => {
+        const ctx = await connect({ action: 'cancel' });
+        try {
+            const result = await ctx.client.callTool({ name: 'delete_object', arguments: { id: 'hue.0.light' } });
+            assert.equal(result.isError, true);
+            assert.match(result.content[0].text, /dismissed without an answer/);
+            assert.match(result.content[0].text, /Ask for confirmation before dangerous actions/);
+            assert.ok(ctx.mock.objects['hue.0.light']);
+        } finally {
+            await ctx.close();
+        }
+    });
+
     it('deletes after the user confirmed', async () => {
         const ctx = await connect({ action: 'accept', content: { confirm: true } });
         try {
@@ -1272,5 +1386,66 @@ describe('large results', () => {
         const tools = await ctx.mcp.listTools();
         assert.ok(tools.length > 0);
         assert.ok(!tools.some(tool => tool.name === 'prepare_upload'));
+    });
+});
+
+describe('failed logins', () => {
+    const { EventEmitter } = require('node:events');
+    const { McpServer } = require('../build/index.js');
+    const { createMockAdapter } = require('./mockAdapter');
+
+    /** Run a request through the logging middleware and answer it with `status`. */
+    function login(mock, req, status) {
+        const mcp = McpServer.createEmbedded({ adapter: mock.adapter });
+        const res = new EventEmitter();
+        res.statusCode = status;
+        let passed = false;
+        mcp.logFailedLogin({ method: 'POST', ip: '192.168.1.7', ...req }, res, () => (passed = true));
+        res.emit('finish');
+        mcp.unload();
+        assert.ok(passed, 'the request must be passed on');
+        return mock.logged.filter(entry => entry.message.includes('Rejected'));
+    }
+
+    it('names the address and the client of a wrong Basic auth password', () => {
+        const mock = createMockAdapter();
+        const logged = login(
+            mock,
+            {
+                path: '/mcp',
+                headers: {
+                    authorization: `Basic ${Buffer.from('mcp:wrong').toString('base64')}`,
+                    'user-agent': 'Claude-User',
+                },
+            },
+            401,
+        );
+        assert.equal(logged.length, 1);
+        assert.equal(logged[0].level, 'warn');
+        assert.match(logged[0].message, /"mcp" from 192\.168\.1\.7 \(User-Agent: "Claude-User"\)/);
+        assert.doesNotMatch(logged[0].message, /wrong/, 'the password must not be logged');
+    });
+
+    it('names the client of a failed password grant', () => {
+        const mock = createMockAdapter();
+        const logged = login(
+            mock,
+            { path: '/oauth/token', headers: {}, body: { grant_type: 'password', username: 'mcp', password: 'x' } },
+            400,
+        );
+        assert.equal(logged[0].level, 'warn');
+        assert.match(logged[0].message, /"mcp" from 192\.168\.1\.7/);
+    });
+
+    it('logs a rejected token only in debug', () => {
+        const mock = createMockAdapter();
+        const logged = login(mock, { path: '/mcp', headers: { authorization: 'Bearer expired' } }, 401);
+        assert.equal(logged[0].level, 'debug');
+    });
+
+    it('does not log successful requests', () => {
+        const mock = createMockAdapter();
+        const logged = login(mock, { path: '/mcp', headers: { authorization: 'Bearer valid' } }, 200);
+        assert.equal(logged.length, 0);
     });
 });

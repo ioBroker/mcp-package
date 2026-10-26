@@ -477,7 +477,19 @@ function createMockAdapter() {
         },
     };
 
-    return { adapter, objects, states, files, logged, subscriptions, permissions, cmdExec, extended, messages };
+    return {
+        adapter,
+        objects,
+        states,
+        files,
+        logged,
+        subscriptions,
+        permissions,
+        cmdExec,
+        extended,
+        messages,
+        hostLogs,
+    };
 }
 
 module.exports = { createMockAdapter, patternToRegExp };

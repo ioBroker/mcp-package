@@ -153,6 +153,16 @@ const DEFAULT_MAX_READ_BYTES = 512 * 1024;
 const DEFAULT_INSTALL_TIMEOUT = 300;
 /** How many output lines of an installation are returned to the client. */
 const INSTALL_OUTPUT_LINES = 100;
+/** Default time `install_package` waits for the restarted instances to come up (seconds). */
+const DEFAULT_START_TIMEOUT = 20;
+/** How many log lines of a restarted instance `install_package` returns. */
+const START_LOG_LINES = 10;
+/** A log whose newest line is older than this (ms) gets a hint that it may no longer be written. */
+const STALE_LOG_AGE = 30 * 60_000;
+/** The "everyone" read bit of an ioBroker ACL; the group and owner bits are shifted by 4 and 8. */
+const ACL_READ = 0x4;
+/** The "everyone" write bit of an ioBroker ACL; the group and owner bits are shifted by 4 and 8. */
+const ACL_WRITE = 0x2;
 
 /**
  * Maximum size of a tool result. MCP clients (Claude.ai / Claude Desktop / Claude Code) reject results above
@@ -532,6 +542,8 @@ export default class McpServer {
             // The OAuth2 token endpoint (added by createOAuth2Server) needs its request body parsed.
             // Scope the parser to that path so the MCP transport keeps its own body handling.
             app.use('/oauth/token', express.urlencoded({ extended: false }), express.json());
+            // The OAuth2 server only logs the user name of a wrong password; tell which client it was
+            app.use(this.logFailedLogin);
             this.oauth2 = createOAuth2Server(this.adapter, {
                 app,
                 secure: !!this.config.secure,
@@ -649,6 +661,37 @@ export default class McpServer {
      */
     private authGuard = (req: Request, res: Response, next: NextFunction): void => {
         void this.checkAuthentication(req, res, next);
+    };
+
+    /**
+     * Log the address and the User-Agent of a request with a rejected password (HTTP Basic auth or the
+     * password grant of `POST /oauth/token`), so a client that keeps retrying can be found. Rejected tokens
+     * (e.g. expired ones, which clients refresh) are only logged in debug.
+     */
+    private logFailedLogin = (req: Request, res: Response, next: NextFunction): void => {
+        const authorization = req.headers.authorization;
+        const tokenRequest = req.path === '/oauth/token';
+        if (authorization || tokenRequest) {
+            res.on('finish', () => {
+                if (res.statusCode !== 401 && !(tokenRequest && res.statusCode === 400)) {
+                    return;
+                }
+                let username: string | undefined;
+                if (tokenRequest) {
+                    const body = req.body as { grant_type?: unknown; username?: unknown } | undefined;
+                    username = body?.grant_type === 'password' ? String(body.username) : undefined;
+                } else if (authorization?.startsWith('Basic ')) {
+                    username = Buffer.from(authorization.substring(6), 'base64').toString().split(':')[0];
+                }
+                const client = `${req.ip} (User-Agent: "${req.headers['user-agent'] || 'unknown'}")`;
+                if (username !== undefined) {
+                    this.adapter.log.warn(`Rejected the password of "${username}" from ${client}`);
+                } else {
+                    this.adapter.log.debug(`Rejected credentials from ${client} on ${req.method} ${req.path}`);
+                }
+            });
+        }
+        next();
     };
 
     /**
@@ -1124,20 +1167,37 @@ export default class McpServer {
         // Ask the user before a dangerous action, if the client can (MCP elicitation). Clients without
         // elicitation rely on the destructiveHint of the tool instead.
         const confirm = async (message: string): Promise<void> => {
-            if (!this.config.confirmDangerous || !server.server.getClientCapabilities()?.elicitation) {
+            if (!this.config.confirmDangerous || !server.server.getClientCapabilities()?.elicitation?.form) {
                 return;
             }
-            const answer = await server.server.elicitInput({
-                message,
-                requestedSchema: {
-                    type: 'object',
-                    properties: { confirm: { type: 'boolean', title: 'Yes, do it' } },
-                    required: ['confirm'],
-                },
-            });
-            if (answer.action !== 'accept' || answer.content?.confirm !== true) {
-                throw new Error('Cancelled by the user');
+            // Some clients announce elicitation but cannot show the request and dismiss it on their own
+            const noDialog =
+                'If no confirmation dialog appeared, the MCP client cannot show confirmation requests (elicitation): ' +
+                'turn off "Ask for confirmation before dangerous actions" in the settings of the MCP adapter, ' +
+                'or use a client that supports elicitation.';
+            let answer: Awaited<ReturnType<typeof server.server.elicitInput>>;
+            try {
+                answer = await server.server.elicitInput({
+                    message,
+                    requestedSchema: {
+                        type: 'object',
+                        properties: { confirm: { type: 'boolean', title: 'Yes, do it' } },
+                        required: ['confirm'],
+                    },
+                });
+            } catch (e) {
+                throw new Error(
+                    `The confirmation request failed: ${e instanceof Error ? e.message : String(e)}. ${noDialog}`,
+                );
             }
+            this.adapter.log.debug(`Confirmation "${message}" answered with "${answer.action}"`);
+            if (answer.action === 'accept' && answer.content?.confirm === true) {
+                return;
+            }
+            if (answer.action === 'cancel') {
+                throw new Error(`The confirmation request was dismissed without an answer. ${noDialog}`);
+            }
+            throw new Error('Cancelled by the user');
         };
 
         server.registerTool(
@@ -1147,7 +1207,9 @@ export default class McpServer {
                 annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                 description:
                     'Retrieve the current value of one or multiple states. IDs may contain wildcards, ' +
-                    'e.g. "hue.0.*.brightness" expands to all matching states.',
+                    'e.g. "hue.0.*.brightness" expands to all matching states. An ID without a state is ' +
+                    'returned with exists=false (no such object) or with a hint (the object exists, but ' +
+                    'has no value yet or is not a state).',
                 inputSchema: {
                     ids: z.array(z.string()).describe('Array of state IDs (wildcards "*" allowed)'),
                     offset: offsetSchema,
@@ -1246,7 +1308,9 @@ export default class McpServer {
                     'Retrieve recent ioBroker log lines from the host log file. Each entry has {ts, level, ' +
                     'source, message}. Optionally filter by `level` (error/warn/info/debug), by `adapter` ' +
                     '(source, e.g. "hm-rpc.0" or "hm-rpc"), or from `from_ts` (ms). When a level filter is set, ' +
-                    'a larger window of the log is scanned so errors/warnings are not hidden behind debug spam.',
+                    'a larger window of the log is scanned so errors/warnings are not hidden behind debug spam. ' +
+                    '`logFile` tells the time of the newest line in the file and its size: if they do not change ' +
+                    'between calls, the host does not see new log lines.',
                 inputSchema: {
                     level: z.array(z.enum(['error', 'warn', 'info', 'debug'])).optional(),
                     from_ts: z.number().int().optional(),
@@ -1257,9 +1321,19 @@ export default class McpServer {
             async args => {
                 try {
                     // Keep the newest lines if not all of them fit
-                    const logs = await this.getLogs(args);
+                    const { logs, newestTs, fileSize } = await this.getLogs(args);
                     const page = fitItems(logs, 0, true);
-                    return ok({ ok: true, data: { logs: page.items, ...pageInfo(page, logs, 'logs.json') } });
+                    const logFile: Record<string, unknown> = { newestLineTs: newestTs ?? null, size: fileSize ?? null };
+                    if (newestTs !== undefined && Date.now() - newestTs > STALE_LOG_AGE) {
+                        logFile.hint =
+                            `The newest line of the log file is ${Math.round((Date.now() - newestTs) / 60_000)} ` +
+                            'minutes old. If newer messages are expected, the host may still read an old log file ' +
+                            '(e.g. the one before the daily rotation).';
+                    }
+                    return ok({
+                        ok: true,
+                        data: { logs: page.items, logFile, ...pageInfo(page, logs, 'logs.json') },
+                    });
                 } catch (e) {
                     return fail(e);
                 }
@@ -1587,6 +1661,29 @@ export default class McpServer {
                 try {
                     const object = await this.adapter.getForeignObjectAsync(id, { user: this.user });
                     return ok({ ok: true, data: { object: object ?? null } });
+                } catch (e) {
+                    return fail(e);
+                }
+            },
+        );
+
+        server.registerTool(
+            'check_permissions',
+            {
+                title: 'Check permissions',
+                annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    'Show what the ioBroker user of this MCP session may do: its user and groups, the general ' +
+                    'rights of its groups (object/state/file/users/other) and, for the given object IDs, whether ' +
+                    'it may read/write/delete the object and read/write the state (by the ACL of the object). ' +
+                    'Use it to find out in advance why an action would fail with a permissionError.',
+                inputSchema: {
+                    ids: z.array(z.string()).max(100).optional().describe('Object IDs to check (no wildcards)'),
+                },
+            },
+            async ({ ids }) => {
+                try {
+                    return ok({ ok: true, data: await this.checkPermissions(ids || []) });
                 } catch (e) {
                     return fail(e);
                 }
@@ -2420,7 +2517,9 @@ export default class McpServer {
                         '`file_name` + `file_content` - a small .tgz as base64; or `upload_id` - a .tgz uploaded ' +
                         'via prepare_upload (for large files, if you can run shell commands). Waits until the installation is ' +
                         'finished (or `timeout`), returns the exit code and the last output lines. Enabled instances ' +
-                        'of the adapter are restarted afterwards; no new instance is created.',
+                        'of the adapter are restarted afterwards; no new instance is created. `instances` tells for ' +
+                        'each restarted instance whether it came up again (alive) within `start_timeout` and its ' +
+                        'first log lines since the restart.',
                     inputSchema: {
                         source: z
                             .string()
@@ -2442,6 +2541,15 @@ export default class McpServer {
                             .boolean()
                             .optional()
                             .describe('Restart enabled instances of the adapter after installing (default true)'),
+                        start_timeout: z
+                            .number()
+                            .int()
+                            .min(0)
+                            .max(300)
+                            .optional()
+                            .describe(
+                                `Seconds to wait for the restarted instances to come up (default ${DEFAULT_START_TIMEOUT}, 0 = do not wait)`,
+                            ),
                         timeout: z
                             .number()
                             .int()
@@ -2796,10 +2904,7 @@ export default class McpServer {
     // ---------------------------------------------------------------------
 
     /** Build the result entry for one state. */
-    private static stateEntry(id: string, state: ioBroker.State | null | undefined): Record<string, unknown> {
-        if (!state) {
-            return { id, value: null, ack: false, ts: Date.now() };
-        }
+    private static stateEntry(id: string, state: ioBroker.State): Record<string, unknown> {
         const entry: Record<string, unknown> = { id, value: state.val, ack: state.ack, ts: state.ts };
         if (state.lc !== state.ts) {
             entry.lc = state.lc;
@@ -2814,24 +2919,37 @@ export default class McpServer {
                 if (id.includes('*')) {
                     // Wildcard pattern: expand to all matching states.
                     const matches = await this.adapter.getForeignStatesAsync(id, { user: this.user });
-                    for (const matchId of Object.keys(matches || {})) {
-                        states.push(McpServer.stateEntry(matchId, matches[matchId]));
+                    for (const [matchId, state] of Object.entries(matches || {})) {
+                        if (state) {
+                            states.push(McpServer.stateEntry(matchId, state));
+                        }
                     }
                 } else {
                     const state = await this.adapter.getForeignStateAsync(id, { user: this.user });
-                    states.push(McpServer.stateEntry(id, state));
+                    states.push(state ? McpServer.stateEntry(id, state) : await this.missingStateEntry(id));
                 }
             } catch (e) {
-                states.push({
-                    id,
-                    value: null,
-                    ack: false,
-                    ts: Date.now(),
-                    error: e instanceof Error ? e.message : String(e),
-                });
+                states.push({ id, value: null, error: e instanceof Error ? e.message : String(e) });
             }
         }
         return states;
+    }
+
+    /** Build the result entry for an ID without a state: tell a missing object from a state without a value. */
+    private async missingStateEntry(id: string): Promise<Record<string, unknown>> {
+        const obj = await this.adapter.getForeignObjectAsync(id, { user: this.user });
+        if (!obj) {
+            return { id, value: null, exists: false };
+        }
+        return {
+            id,
+            value: null,
+            exists: true,
+            hint:
+                obj.type === 'state'
+                    ? 'The object exists, but the state has no value yet'
+                    : `"${id}" is a ${obj.type} object, not a state`,
+        };
     }
 
     /**
@@ -2911,16 +3029,89 @@ export default class McpServer {
         if (!acl || !stateAcl) {
             return true;
         }
-        if (!permissions.state?.write) {
-            return false;
-        }
-        let mask = 0x002; // everyone write
+        return !!permissions.state?.write && this.aclGrants(acl, stateAcl, ACL_WRITE, permissions);
+    }
+
+    /**
+     * The ACL bit check of js-controller: the owner, owner-group or everyone bits of `bits`, depending on
+     * who the user of the request is.
+     *
+     * @param acl the ACL of the object (owner and owner group)
+     * @param bits the `object` or `state` bits of the ACL
+     * @param flag {@link ACL_READ} or {@link ACL_WRITE} (as the "everyone" bit)
+     * @param permissions the merged group permissions of the user
+     */
+    private aclGrants(
+        acl: Partial<ioBroker.StateACL>,
+        bits: number,
+        flag: number,
+        permissions: ioBroker.PermissionSet,
+    ): boolean {
         if (acl.owner === this.user) {
-            mask = 0x200; // owner write
-        } else if (acl.ownerGroup && permissions.groups?.includes(acl.ownerGroup)) {
-            mask = 0x020; // group write
+            return !!(bits & (flag << 8));
         }
-        return !!(stateAcl & mask);
+        if (acl.ownerGroup && permissions.groups?.includes(acl.ownerGroup)) {
+            return !!(bits & (flag << 4));
+        }
+        return !!(bits & flag);
+    }
+
+    /**
+     * What the user of the request may do: the general rights of its groups and, per object, the result of
+     * the ACL checks js-controller runs for reading, writing and deleting the object and its state.
+     *
+     * @param ids object IDs to check
+     */
+    private async checkPermissions(ids: string[]): Promise<Record<string, unknown>> {
+        const permissions = await this.adapter.calculatePermissionsAsync(this.user, []);
+        const admin = this.user === 'system.user.admin' || !!permissions.groups?.includes('system.group.administrator');
+        const rights = {
+            object: permissions.object,
+            state: permissions.state,
+            file: permissions.file,
+            users: permissions.users,
+            other: permissions.other,
+        };
+        const objects: Record<string, unknown>[] = [];
+        for (const id of ids) {
+            // Read with the rights of the adapter: the ACL of objects the user may not read is needed as well
+            const obj = await this.adapter.getForeignObjectAsync(id);
+            if (!obj) {
+                objects.push({ id, exists: false });
+                continue;
+            }
+            const acl = obj.acl as Partial<ioBroker.StateACL> | undefined;
+            const allowed = (general: boolean | undefined, bits: number | undefined, flag: number): boolean =>
+                admin || (!!general && (!acl || bits === undefined || this.aclGrants(acl, bits, flag, permissions)));
+            const entry: Record<string, unknown> = {
+                id,
+                exists: true,
+                type: obj.type,
+                object: {
+                    read: allowed(permissions.object?.read, acl?.object, ACL_READ),
+                    write: allowed(permissions.object?.write, acl?.object, ACL_WRITE),
+                    delete: allowed(permissions.object?.delete, acl?.object, ACL_WRITE),
+                },
+            };
+            if (obj.type === 'state') {
+                const stateBits = acl?.state ?? acl?.object;
+                entry.state = {
+                    read: allowed(permissions.state?.read, stateBits, ACL_READ),
+                    write: allowed(permissions.state?.write, stateBits, ACL_WRITE),
+                };
+            }
+            if (acl && (admin || (entry.object as { read: boolean }).read)) {
+                entry.acl = { owner: acl.owner, ownerGroup: acl.ownerGroup, object: acl.object, state: acl.state };
+            }
+            objects.push(entry);
+        }
+        return {
+            user: this.user,
+            groups: permissions.groups || [],
+            admin,
+            rights,
+            ...(ids.length ? { objects } : {}),
+        };
     }
 
     /**
@@ -2962,12 +3153,18 @@ export default class McpServer {
         return entries;
     }
 
+    /**
+     * Read the tail of the host log file and filter it.
+     *
+     * @returns the matching lines plus the time of the newest line in the read window and the file size, so a
+     *          log file that is no longer written (e.g. the host still reads the one before a rotation) shows
+     */
     private getLogs(params: {
         level?: string[];
         from_ts?: number;
         limit?: number;
         adapter?: string;
-    }): Promise<Record<string, unknown>[]> {
+    }): Promise<{ logs: Record<string, unknown>[]; newestTs?: number; fileSize?: number }> {
         const limit = Math.max(1, params.limit || 200);
         const filtering = !!((params.level && params.level.length) || params.adapter || params.from_ts !== undefined);
         // The host `getLogs` returns the tail of the log file (≈150 bytes per requested line). When a
@@ -2984,11 +3181,15 @@ export default class McpServer {
                     if (result && result.error) {
                         reject(new Error(result.error));
                     } else {
-                        resolve([]);
+                        resolve({ logs: [] });
                     }
                     return;
                 }
                 let logs = this.parseLogLines(rawList);
+                const newestTs = logs.length ? logs[logs.length - 1].ts : undefined;
+                // The host appends the size of the log file as the last element
+                const last = rawList[rawList.length - 1];
+                const fileSize = typeof last === 'number' ? last : undefined;
                 if (params.level && params.level.length) {
                     logs = logs.filter(log => params.level!.includes(log.level));
                 }
@@ -3003,15 +3204,17 @@ export default class McpServer {
                 if (logs.length > limit) {
                     logs = logs.slice(logs.length - limit);
                 }
-                resolve(
-                    logs.map(log => ({
+                resolve({
+                    logs: logs.map(log => ({
                         ts: log.ts,
                         level: log.level,
                         source: log.source,
                         message: log.message,
                         host: this.adapter.host,
                     })),
-                );
+                    newestTs,
+                    fileSize,
+                });
             });
         });
     }
@@ -3859,6 +4062,7 @@ export default class McpServer {
         host?: string;
         debug?: boolean;
         restart_instances?: boolean;
+        start_timeout?: number;
         timeout?: number;
     }): Promise<Record<string, unknown>> {
         const given = [params.source, params.file_path, params.file_content, params.upload_id].filter(
@@ -3932,11 +4136,75 @@ export default class McpServer {
         const adapterName = extractAdapterName(
             params.file_path || params.file_name || upload?.name || params.source || '',
         );
+        const restartTs = Date.now();
         const restarted =
             result.success && adapterName && params.restart_instances !== false
                 ? await this.restartAdapterInstances(adapterName)
                 : [];
-        return { ...result, adapter: adapterName, restartedInstances: restarted };
+        const startTimeout = params.start_timeout ?? DEFAULT_START_TIMEOUT;
+        return {
+            ...result,
+            adapter: adapterName,
+            restartedInstances: restarted,
+            ...(restarted.length && startTimeout
+                ? { instances: await this.waitForStart(restarted, restartTs, startTimeout) }
+                : {}),
+        };
+    }
+
+    /**
+     * Wait until restarted instances report `alive` again, then collect their first log lines since the restart.
+     * Instances that are not daemons (schedule, once, ...) do not stay alive and are not waited for.
+     *
+     * @param ids instance ids like `hue.0`
+     * @param since time of the restart (ms); only an `alive` and log lines after it count
+     * @param timeoutSeconds how long to wait for all instances together
+     */
+    private async waitForStart(
+        ids: string[],
+        since: number,
+        timeoutSeconds: number,
+    ): Promise<Record<string, unknown>[]> {
+        const results: Record<string, unknown>[] = [];
+        const deadline = since + timeoutSeconds * 1000;
+        for (const id of ids) {
+            const obj = await this.adapter.getForeignObjectAsync(`system.adapter.${id}`, { user: this.user });
+            const mode = (obj?.common as ioBroker.InstanceCommon | undefined)?.mode;
+            if (mode && mode !== 'daemon') {
+                results.push({ id, mode, note: `Not checked: a ${mode} instance does not stay running` });
+                continue;
+            }
+            let alive = false;
+            for (;;) {
+                const state = await this.adapter.getForeignStateAsync(`system.adapter.${id}.alive`, {
+                    user: this.user,
+                });
+                // `lc`, not `ts`: the heartbeat of the old process refreshes `ts` until it is stopped
+                alive = !!state?.val && (state.lc ?? state.ts) >= since;
+                if (alive || Date.now() >= deadline) {
+                    break;
+                }
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            results.push({ id, alive, ...(alive ? {} : { note: `Not alive after ${timeoutSeconds}s` }) });
+        }
+        // The first lines since the restart show whether the start went well
+        try {
+            for (const entry of results) {
+                if (entry.mode) {
+                    continue;
+                }
+                const { logs } = await this.getLogs({ adapter: entry.id as string, from_ts: since, limit: 500 });
+                entry.logs = logs.slice(0, START_LOG_LINES).map(log => ({
+                    ts: log.ts,
+                    level: log.level,
+                    message: log.message,
+                }));
+            }
+        } catch (e) {
+            this.adapter.log.debug(`Cannot read the log after the restart: ${e instanceof Error ? e.message : e}`);
+        }
+        return results;
     }
 
     /** Normalize a host name (with or without `system.host.`) and check that the host exists. */

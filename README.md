@@ -177,8 +177,9 @@ Point your MCP client at:
 
 | Tool                        | Description                                                                                                                                                                                                                                          |
 |-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `get_states`                | Retrieve the current value of one or multiple states; IDs may contain wildcards (e.g. `hue.0.*.brightness`)                                                                                                                                          |
+| `get_states`                | Retrieve the current value of one or multiple states; IDs may contain wildcards (e.g. `hue.0.*.brightness`); an ID without a state is returned with `exists: false` or a hint                                                                      |
 | `get_object`                | Read a single object by its ID                                                                                                                                                                                                                       |
+| `check_permissions`         | Show the user and groups of the MCP session, the rights of its groups and, for given object IDs, whether it may read/write/delete the object and read/write the state                                                                               |
 | `search_objects`            | Search objects/states by keyword (matched against ID and name); optional filters for object `type`, `role`, `room` and source `adapter` instance                                                                                                     |
 | `list_devices`              | List detected devices grouped by room (uses the ioBroker type-detector to expose functional devices with named controls); optional `language` and `room` filter                                                                                      |
 | `list_instances`            | List adapter instances with their status                                                                                                                                                                                                             |
@@ -191,7 +192,7 @@ Point your MCP client at:
 | `read_file`                 | Read a file from an adapter file storage (optional base64); large files are read in chunks via `offset`/`length` (default 512 KiB per call) — the result carries `size`, `truncated` and `nextOffset`; `download: true` returns a download link instead |
 | `list_files`                | List a directory in an adapter file storage                                                                                                                                                                                                          |
 | `file_exists`               | Check whether a file exists in an adapter file storage                                                                                                                                                                                               |
-| `get_logs`                  | Retrieve recent ioBroker log lines; optional filters by `level` (error/warn/info/debug), source `adapter` and start time (`from_ts`)                                                                                                                 |
+| `get_logs`                  | Retrieve recent ioBroker log lines; optional filters by `level` (error/warn/info/debug), source `adapter` and start time (`from_ts`); `logFile` tells the time of the newest line and the file size                                                                                                                 |
 | `write_log`                 | Write a message to the ioBroker log                                                                                                                                                                                                                  |
 | `system_info`               | Get system and js-controller information                                                                                                                                                                                                             |
 | `list_adapter_updates`      | List installed adapters that have a newer version in the active repository                                                                                                                                                                           |
@@ -212,7 +213,7 @@ Point your MCP client at:
 | `rename_file`               | Rename/move a file within the same adapter file storage — requires *Allow object/file changes*                                                                                                                                                       |
 | `mkdir`                     | Create a directory in an adapter file storage — requires *Allow object/file changes*                                                                                                                                                                 |
 | `prepare_upload`            | Get a one-time upload link for a file that is too large for a tool argument (e.g. a `.tgz`), for clients that can run shell commands — requires *Allow download/upload links* and *Allow object/file changes* or *Allow installing packages*           |
-| `install_package`           | Install an adapter package (npm, GitHub, URL, `.tgz` from the file storage, as base64 or uploaded via `prepare_upload`) on a host and restart its enabled instances — requires *Allow installing packages*, developers only                            |
+| `install_package`           | Install an adapter package (npm, GitHub, URL, `.tgz` from the file storage, as base64 or uploaded via `prepare_upload`) on a host, restart its enabled instances and report whether they came up, with their first log lines — requires *Allow installing packages*, developers only |
 | `start_instance`            | Start (enable) an instance — requires *Allow controlling instances*                                                                                                                                                                                  |
 | `stop_instance`             | Stop (disable) an instance — requires *Allow controlling instances*                                                                                                                                                                                  |
 | `restart_instance`          | Restart a running instance — requires *Allow controlling instances*                                                                                                                                                                                  |
@@ -310,6 +311,14 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) A confirmation that the client dismissed without an answer is no longer reported as "Cancelled by the user", but explains how to turn off the confirmations for clients that cannot show them
+* (@GermanBluefox) `get_states` returns `exists: false` for an unknown ID instead of a `null` value with the current time
+* (@GermanBluefox) A wrong password is logged with the address and the User-Agent of the client
+* (@GermanBluefox) `get_logs` returns the time of the newest line and the size of the log file, to see when the log is no longer written
+* (@GermanBluefox) Added the `check_permissions` tool: what the user of the MCP session may do with an object
+* (@GermanBluefox) `install_package` reports whether the restarted instances came up again and their first log lines
+
 ### 1.6.1 (2026-10-24)
 * (@GermanBluefox) An upload can only be used by the user that created it with `prepare_upload`
 
