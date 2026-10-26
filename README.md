@@ -335,7 +335,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.8.0 (2026-10-26)
 * (@GermanBluefox) Security: commands on a host (`install_package`, `add_instance`, `delete_instance`, `upgrade_adapter`) require the "execute" right of the user, messages to adapters (`send_to`, `run_script`) the "sendto" right, like in admin. Before, they ran with the rights of the adapter
 * (@GermanBluefox) `install_package` reports a done installation even if the instances could not be restarted afterwards (`restartError`), instead of failing
 * (@GermanBluefox) Every call of a changing tool is logged with the user, the tool and its arguments; a failed call names the tool and its arguments
