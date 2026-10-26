@@ -112,6 +112,11 @@ const DEFAULT_WAIT_TIMEOUT = 30;
 const MAX_WAIT_TIMEOUT = 50;
 /** How often a state is read while waiting for it (ms). */
 const STATE_POLL_INTERVAL = 250;
+/**
+ * The upload progress of an adapter, which js-controller writes without object when it uploads the admin files:
+ * no orphan.
+ */
+const UPLOAD_STATE = /^system\.adapter\.[^.]+\.upload$/;
 
 const LOOPBACK = new net.BlockList();
 LOOPBACK.addSubnet('127.0.0.0', 8, 'ipv4');
@@ -1487,6 +1492,8 @@ export default class McpServer {
                     'instance. The other tools and admin do not show them, but scripts and visualizations may still ' +
                     'read their old values. `pattern` selects the states to check, e.g. "system.adapter.*" or ' +
                     '"hue.0.*"; "*" checks all states and objects, which takes a while on large installations. ' +
+                    'The upload progress of the adapters ("system.adapter.<adapter>.upload") is not reported: ' +
+                    'js-controller writes it without object on purpose. ' +
                     'Found states can be deleted on the host with `iobroker state del <id>`.',
                 inputSchema: {
                     pattern: z
@@ -4219,7 +4226,7 @@ export default class McpServer {
         const orphans: Record<string, unknown>[] = [];
         for (const id of Object.keys(states).sort()) {
             // the rare state of an object of another type is no orphan either
-            if (objects.has(id) || (await this.adapter.getForeignObjectAsync(id))) {
+            if (UPLOAD_STATE.test(id) || objects.has(id) || (await this.adapter.getForeignObjectAsync(id))) {
                 continue;
             }
             const state = states[id];

@@ -1528,6 +1528,8 @@ describe('find_orphan_states', () => {
         };
         // the state of an object of another type is no orphan
         ctx.states['system.adapter.scene.0'] = { val: 1, ack: true, ts: 1_700_000_000_000 };
+        // neither is the upload progress, which js-controller writes without object
+        ctx.states['system.adapter.hue.upload'] = { val: 0, ack: true, ts: 1_700_000_000_000 };
     });
 
     afterEach(async () => {
@@ -1536,7 +1538,7 @@ describe('find_orphan_states', () => {
 
     it('finds the states without object', async () => {
         const data = await callOk(ctx.mcp, 'find_orphan_states', { pattern: 'system.adapter.*' });
-        assert.equal(data.checked, 5);
+        assert.equal(data.checked, 6);
         assert.deepEqual(data.orphans, [
             { id: 'system.adapter.scene.0.alive', val: true, ack: true, ts: 1_750_000_000_000 },
             {

@@ -200,7 +200,7 @@ Point your MCP client at:
 |-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `get_states`                | Retrieve the current value of one or multiple states; IDs may contain wildcards (e.g. `hue.0.*.brightness`); an ID without a state is returned with `exists: false` or a hint                                                                      |
 | `wait_for_state`            | Wait until a state has a `value` (or, without `value`, until it is updated), optionally only with `ack`; gives up after `timeout` seconds (default 30, at most 50) with `reached: false`                                                             |
-| `find_orphan_states`        | Find states without object (e.g. `system.adapter.vis.0.alive` of a deleted instance) by an ID `pattern`; delete them on the host with `iobroker state del <id>`                                                                                      |
+| `find_orphan_states`        | Find states without object (e.g. `system.adapter.vis.0.alive` of a deleted instance) by an ID `pattern`, except the upload progress `system.adapter.<adapter>.upload`, which has no object on purpose; delete them on the host with `iobroker state del <id>`|
 | `get_object`                | Read a single object by its ID                                                                                                                                                                                                                       |
 | `check_permissions`         | Show the user and groups of the MCP session, the rights of its groups and, for given object IDs, whether it may read/write/delete the object and read/write the state                                                                               |
 | `search_objects`            | Search objects/states by keyword (matched against ID and name); optional filters for object `type`, `role`, `room` and source `adapter` instance                                                                                                     |
@@ -335,6 +335,9 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) `find_orphan_states` no longer reports the upload progress of the adapters (`system.adapter.<adapter>.upload`), which js-controller writes without object on purpose
+
 ### 1.8.0 (2026-10-26)
 * (@GermanBluefox) Security: commands on a host (`install_package`, `add_instance`, `delete_instance`, `upgrade_adapter`) require the "execute" right of the user, messages to adapters (`send_to`, `run_script`) the "sendto" right, like in admin. Before, they ran with the rights of the adapter
 * (@GermanBluefox) `install_package` reports a done installation even if the instances could not be restarted afterwards (`restartError`), instead of failing
