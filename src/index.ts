@@ -12,7 +12,11 @@ import { z } from 'zod';
 import express, { type Express, type Request, type RequestHandler, type Response, type NextFunction } from 'express';
 
 import { createOAuth2Server, type OAuth2Model } from '@iobroker/webserver';
-import { McpServer as McpSdkServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+    McpServer as McpSdkServer,
+    ResourceTemplate,
+    type RegisteredTool,
+} from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
     isInitializeRequest,
@@ -55,6 +59,59 @@ const AGG_MAP: Record<string, ioBroker.GetHistoryOptions['aggregate']> = {
     integral: 'integral',
 };
 const WEB_EXTENSION_PREFIX = 'mcp/';
+/** Arguments of tool calls whose values are not written to the log, besides file contents (may hold secrets). */
+const LOG_HIDDEN_ARGS: Record<string, string[]> = {
+    send_to: ['message'],
+    set_script: ['source'],
+    run_script: ['source'],
+};
+/** Values of tool arguments are cut after this many characters in the log. */
+const LOG_ARG_LENGTH = 200;
+
+type Rights = ioBroker.PermissionSet;
+const objectWrite = (rights: Rights): boolean => !!rights.object?.write;
+const fileWrite = (rights: Rights): boolean => !!rights.file?.write;
+const execute = (rights: Rights): boolean => !!rights.other?.execute;
+const sendTo = (rights: Rights): boolean => !!rights.other?.sendto;
+/**
+ * The general rights (of the groups of the ioBroker user) without which a tool cannot succeed: such tools are not
+ * offered to the sessions of the user. Tools not listed here are offered to everyone.
+ */
+const TOOL_RIGHTS: Record<string, (rights: Rights) => boolean> = {
+    set_state: rights => !!rights.state?.write,
+    set_states: rights => !!rights.state?.write,
+    set_object: objectWrite,
+    create_state: objectWrite,
+    create_scene: objectWrite,
+    create_alias: objectWrite,
+    delete_object: rights => !!rights.object?.delete,
+    write_file: fileWrite,
+    rename_file: fileWrite,
+    mkdir: fileWrite,
+    delete_file: rights => !!rights.file?.delete,
+    start_instance: objectWrite,
+    stop_instance: objectWrite,
+    restart_instance: objectWrite,
+    // persistently in the instance object, or temporarily in its logLevel state
+    set_log_level: rights => objectWrite(rights) || !!rights.state?.write,
+    add_instance: execute,
+    delete_instance: execute,
+    upgrade_adapter: execute,
+    install_package: execute,
+    // for write_file or install_package
+    prepare_upload: rights => fileWrite(rights) || execute(rights),
+    set_script: objectWrite,
+    enable_script: objectWrite,
+    delete_script: rights => !!rights.object?.delete,
+    run_script: sendTo,
+    send_to: sendTo,
+};
+/** Default time `wait_for_state` waits (seconds). */
+const DEFAULT_WAIT_TIMEOUT = 30;
+/** Longest wait of `wait_for_state` and `set_state` (seconds): many MCP clients give up on a call after 60 s. */
+const MAX_WAIT_TIMEOUT = 50;
+/** How often a state is read while waiting for it (ms). */
+const STATE_POLL_INTERVAL = 250;
 
 const LOOPBACK = new net.BlockList();
 LOOPBACK.addSubnet('127.0.0.0', 8, 'ipv4');
@@ -293,6 +350,8 @@ export default class McpServer {
     private readonly subscriptionCounts: Record<string, number> = {};
     /** Recent log lines kept for `ioblog://` resource reads (filled while there are log subscribers). */
     private readonly logBuffer: ioBroker.LogMessage[] = [];
+    /** The tools of every server created by {@link createServer}, for {@link hideToolsWithoutRights}. */
+    private readonly registeredTools = new WeakMap<McpSdkServer, Map<string, RegisteredTool>>();
     private config: McpConfig;
     private readonly extension: boolean;
     private readonly routerPrefix: string;
@@ -455,10 +514,54 @@ export default class McpServer {
      * Build a fresh MCP SDK server with all ioBroker tools registered, ready to be connected to an
      * arbitrary transport. Used for in-process embedding (e.g. by ioBroker.admin) over an
      * InMemoryTransport, where there is no HTTP server/session layer. The caller owns the lifecycle
-     * of the returned server (connect it to a transport, and `close()` it when done).
+     * of the returned server (connect it to a transport, and `close()` it when done). Call
+     * {@link hideToolsWithoutRights} before connecting it to offer only the tools the user may use.
      */
     createInProcessServer(): McpSdkServer {
         return this.createServer(new Set<string>());
+    }
+
+    /**
+     * Do not offer the tools the user cannot use, because its groups lack a general right the tool needs (e.g.
+     * `install_package` without "execute"), so the client does not try them in vain. Administrators get all
+     * tools. The rights are read once, before the server is connected: changed rights apply to new sessions,
+     * and every call is checked anyway.
+     *
+     * @param server a server returned by {@link createInProcessServer}
+     * @param user the ioBroker user of the session (default: the configured default user)
+     * @returns the names of the hidden tools
+     */
+    async hideToolsWithoutRights(
+        server: McpSdkServer,
+        user: `system.user.${string}` = this.defaultUser,
+    ): Promise<string[]> {
+        const tools = this.registeredTools.get(server);
+        if (!tools || user === 'system.user.admin') {
+            return [];
+        }
+        let rights: Rights;
+        try {
+            rights = await this.adapter.calculatePermissionsAsync(user, []);
+        } catch (e) {
+            this.adapter.log.warn(
+                `Cannot read the rights of ${user}, all tools are offered: ${e instanceof Error ? e.message : e}`,
+            );
+            return [];
+        }
+        if (rights.groups?.includes('system.group.administrator')) {
+            return [];
+        }
+        const hidden: string[] = [];
+        for (const [name, tool] of tools) {
+            if (TOOL_RIGHTS[name] && !TOOL_RIGHTS[name](rights)) {
+                tool.disable();
+                hidden.push(name);
+            }
+        }
+        if (hidden.length) {
+            this.adapter.log.debug(`MCP tools not offered to ${user} for lack of rights: ${hidden.join(', ')}`);
+        }
+        return hidden;
     }
 
     /**
@@ -921,6 +1024,7 @@ export default class McpServer {
                 }
             };
 
+            await this.hideToolsWithoutRights(server, user);
             await server.connect(transport);
         }
 
@@ -1091,6 +1195,85 @@ export default class McpServer {
     }
 
     /**
+     * Remember every tool registered on `server` afterwards (for {@link hideToolsWithoutRights}) and log its
+     * calls: a failed call as a warning with the tool and its arguments, a successful call of a writing tool
+     * (not `readOnlyHint`) at info level, so the log shows who changed what.
+     *
+     * @param server the server whose `registerTool` is wrapped
+     */
+    private trackTools(server: McpSdkServer): void {
+        type Handler = (...params: unknown[]) => Promise<ToolResult>;
+        const register = server.registerTool.bind(server) as (
+            name: string,
+            config: unknown,
+            handler: Handler,
+        ) => RegisteredTool;
+        const tools = new Map<string, RegisteredTool>();
+        this.registeredTools.set(server, tools);
+        (server as unknown as { registerTool: unknown }).registerTool = (
+            name: string,
+            config: { annotations?: { readOnlyHint?: boolean } },
+            handler: Handler,
+        ): RegisteredTool => {
+            const tool = register(name, config, async (...params) => {
+                // Tools with an input schema get (args, extra), the others only (extra)
+                const call = `${name}(${McpServer.describeArgs(name, params.length > 1 ? params[0] : undefined)})`;
+                let result: ToolResult;
+                try {
+                    result = await handler(...params);
+                } catch (e) {
+                    this.adapter.log.warn(
+                        `MCP tool error in ${call} by ${this.user}: ${e instanceof Error ? e.message : e}`,
+                    );
+                    throw e;
+                }
+                if (result?.isError) {
+                    let error = result.content?.[0]?.text;
+                    try {
+                        error = JSON.parse(error).error ?? error;
+                    } catch {
+                        // not JSON: log the text as it is
+                    }
+                    this.adapter.log.warn(`MCP tool error in ${call} by ${this.user}: ${error}`);
+                } else if (config?.annotations?.readOnlyHint === false) {
+                    this.adapter.log.info(`MCP ${this.user}: ${call}`);
+                }
+                return result;
+            });
+            tools.set(name, tool);
+            return tool;
+        };
+    }
+
+    /**
+     * The arguments of a tool call for the log: long values are shortened, and contents that may hold secrets
+     * or large data (file contents, script code, message payloads) are replaced by their size.
+     *
+     * @param tool name of the tool
+     * @param args arguments of the call
+     */
+    private static describeArgs(tool: string, args: unknown): string {
+        if (!args || typeof args !== 'object') {
+            return '';
+        }
+        const hidden = ['content', 'file_content', ...(LOG_HIDDEN_ARGS[tool] || [])];
+        const parts: string[] = [];
+        for (const [key, value] of Object.entries(args)) {
+            if (value === undefined) {
+                continue;
+            }
+            let text = JSON.stringify(value) ?? String(value);
+            if (hidden.includes(key)) {
+                text = `<${text.length} chars>`;
+            } else if (text.length > LOG_ARG_LENGTH) {
+                text = `${text.slice(0, LOG_ARG_LENGTH)}...`;
+            }
+            parts.push(`${key}=${text}`);
+        }
+        return parts.join(', ');
+    }
+
+    /**
      * Create a new MCP SDK server with all ioBroker tools registered.
      *
      * @param subscriptions the per-session set of subscribed state ids (mutated by subscribe/unsubscribe)
@@ -1101,10 +1284,11 @@ export default class McpServer {
             { name: SERVER_NAME, version: SERVER_VERSION },
             { capabilities: { tools: {}, resources: { subscribe: true } } },
         );
+        this.trackTools(server);
 
+        // Logged by trackTools, together with the tool and its arguments
         const fail = (error: unknown): ToolResult => {
             const message = error instanceof Error ? error.message : String(error);
-            this.adapter.log.warn(`MCP tool error: ${message}`);
             return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: message }) }], isError: true };
         };
         const canLink = this.linksAvailable && !!baseUrl;
@@ -1226,6 +1410,111 @@ export default class McpServer {
             },
         );
 
+        server.registerTool(
+            'wait_for_state',
+            {
+                title: 'Wait for a state value',
+                annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    'Wait until a state has the given `value` - or, without `value`, until it is updated - and ' +
+                    'return the state, e.g. to check that a device really switched or a process finished. ' +
+                    `Gives up after \`timeout\` seconds (default ${DEFAULT_WAIT_TIMEOUT}) with reached=false. ` +
+                    `The state is read every ${STATE_POLL_INTERVAL} ms, so a value that lasts shorter can be missed.`,
+                inputSchema: {
+                    id: z.string().describe('State ID'),
+                    value: z
+                        .any()
+                        .optional()
+                        .describe('Expected value (coerced to the state type); omit it to wait for the next update'),
+                    ack: z
+                        .boolean()
+                        .optional()
+                        .describe(
+                            'Only accept a state with this flag: true = confirmed by the device, false = command',
+                        ),
+                    timeout: z
+                        .number()
+                        .min(0)
+                        .max(MAX_WAIT_TIMEOUT)
+                        .optional()
+                        .describe(`Seconds to wait at most (default ${DEFAULT_WAIT_TIMEOUT})`),
+                },
+            },
+            async ({ id, value, ack, timeout }, extra) => {
+                try {
+                    const seconds = timeout ?? DEFAULT_WAIT_TIMEOUT;
+                    const obj = await this.adapter.getForeignObjectAsync(id, { user: this.user });
+                    const expected = McpServer.coerceValue(value, (obj?.common as AnyCommon | undefined)?.type);
+                    const initial = await this.adapter.getForeignStateAsync(id, { user: this.user });
+                    const result = await this.waitForState(
+                        id,
+                        state =>
+                            !!state &&
+                            (ack === undefined || state.ack === ack) &&
+                            (value === undefined
+                                ? !initial || state.ts !== initial.ts
+                                : McpServer.sameValue(state.val, expected)),
+                        seconds,
+                        extra.signal,
+                    );
+                    return ok({
+                        ok: true,
+                        data: {
+                            id,
+                            reached: result.reached,
+                            state: result.state ?? null,
+                            waited_ms: result.waited,
+                            ...(result.reached
+                                ? {}
+                                : {
+                                      hint: `${value === undefined ? 'Not updated' : 'The value was not reached'} within ${seconds} s`,
+                                  }),
+                        },
+                    });
+                } catch (e) {
+                    return fail(e);
+                }
+            },
+        );
+
+        server.registerTool(
+            'find_orphan_states',
+            {
+                title: 'Find states without object',
+                annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    'Find states that have no object, e.g. "system.adapter.vis.0.alive" left over from a deleted ' +
+                    'instance. The other tools and admin do not show them, but scripts and visualizations may still ' +
+                    'read their old values. `pattern` selects the states to check, e.g. "system.adapter.*" or ' +
+                    '"hue.0.*"; "*" checks all states and objects, which takes a while on large installations. ' +
+                    'Found states can be deleted on the host with `iobroker state del <id>`.',
+                inputSchema: {
+                    pattern: z
+                        .string()
+                        .min(1)
+                        .describe('IDs of the states to check, wildcards "*" allowed, e.g. "system.adapter.*"'),
+                    offset: offsetSchema,
+                },
+            },
+            async ({ pattern, offset }) => {
+                try {
+                    const { checked, orphans } = await this.findOrphanStates(pattern);
+                    const page = fitItems(orphans, offset);
+                    return ok({
+                        ok: true,
+                        data: {
+                            pattern,
+                            checked,
+                            orphans: page.items,
+                            ...pageInfo(page, orphans, 'orphans.json'),
+                        },
+                    });
+                } catch (e) {
+                    return fail(e);
+                }
+            },
+        );
+
         if (this.config.allowSetState) {
             server.registerTool(
                 'set_state',
@@ -1238,7 +1527,10 @@ export default class McpServer {
                         openWorldHint: false,
                     },
                     description:
-                        'Set the value of a state. The value is coerced to the state type (boolean/number/string).',
+                        'Set the value of a state. The value is coerced to the state type (boolean/number/string). ' +
+                        'With `wait_ack`, wait until the adapter of the device confirms the command (ack=true) and ' +
+                        'return the confirmed state - its value may differ from the written one, e.g. when the ' +
+                        'device limits it.',
                     inputSchema: {
                         id: z.string().describe('State ID'),
                         value: z.any().describe('New value (type depends on the state)'),
@@ -1250,12 +1542,49 @@ export default class McpServer {
                             // fields of the other tools, which pass their defaults in code instead.
                             .object({ ack: z.boolean().default(false), expire: z.number().int().nullable().optional() })
                             .optional(),
+                        wait_ack: z
+                            .number()
+                            .min(0)
+                            .max(MAX_WAIT_TIMEOUT)
+                            .optional()
+                            .describe(
+                                'Wait up to this many seconds for the confirmation (ack=true) by the adapter of the ' +
+                                    'device (only for a command, i.e. ack=false)',
+                            ),
                     },
                 },
-                async ({ id, value, options }) => {
+                async ({ id, value, options, wait_ack }, extra) => {
                     try {
-                        const written = await this.setState(id, value, options?.ack ?? false);
-                        return ok({ ok: true, data: { id, value: written } });
+                        const ack = options?.ack ?? false;
+                        const written = await this.setState(id, value, ack);
+                        const data: Record<string, unknown> = { id, value: written };
+                        if (wait_ack && !ack) {
+                            try {
+                                // Our command is stored with ack=false, so a state with ack=true is the answer
+                                const result = await this.waitForState(
+                                    id,
+                                    state => !!state?.ack,
+                                    wait_ack,
+                                    extra.signal,
+                                );
+                                Object.assign(data, {
+                                    acked: result.reached,
+                                    state: result.state,
+                                    waited_ms: result.waited,
+                                    ...(result.reached
+                                        ? {}
+                                        : {
+                                              hint:
+                                                  `The value was written, but not confirmed within ${wait_ack} s: the ` +
+                                                  'device may be unreachable, or no adapter processes this state',
+                                          }),
+                                });
+                            } catch (e) {
+                                data.acked = false;
+                                data.ackError = `The value was written, but the confirmation cannot be read: ${e instanceof Error ? e.message : e}`;
+                            }
+                        }
+                        return ok({ ok: true, data });
                     } catch (e) {
                         return fail(e);
                     }
@@ -1307,8 +1636,9 @@ export default class McpServer {
                 description:
                     'Retrieve recent ioBroker log lines from the host log file. Each entry has {ts, level, ' +
                     'source, message}. Optionally filter by `level` (error/warn/info/debug), by `adapter` ' +
-                    '(source, e.g. "hm-rpc.0" or "hm-rpc"), or from `from_ts` (ms). When a level filter is set, ' +
-                    'a larger window of the log is scanned so errors/warnings are not hidden behind debug spam. ' +
+                    '(source, e.g. "hm-rpc.0" or "hm-rpc"), from `from_ts` (ms), or by `search` in the message. ' +
+                    'When a filter is set, a larger window of the log is scanned so the matching lines are not ' +
+                    'hidden behind debug spam. ' +
                     '`logFile` tells the time of the newest line in the file and its size: if they do not change ' +
                     'between calls, the host does not see new log lines.',
                 inputSchema: {
@@ -1316,6 +1646,13 @@ export default class McpServer {
                     from_ts: z.number().int().optional(),
                     limit: z.number().int().optional().describe('Maximum number of lines to return (default 200)'),
                     adapter: z.string().optional(),
+                    search: z
+                        .string()
+                        .optional()
+                        .describe(
+                            'Only lines whose message contains this text (case-insensitive), or matches it as a ' +
+                                'regular expression when written as /pattern/flags, e.g. "/timeout|ECONNREFUSED/i"',
+                        ),
                 },
             },
             async args => {
@@ -2408,6 +2745,8 @@ export default class McpServer {
                 },
                 async args => {
                     try {
+                        // Before asking: the user should not confirm what is denied anyway
+                        await this.assertOtherPermission('execute', 'run commands on a host');
                         await confirm(
                             `Delete the instance "${args.id}" with its configuration, objects and states? This cannot be undone.`,
                         );
@@ -2440,6 +2779,7 @@ export default class McpServer {
                 },
                 async args => {
                     try {
+                        await this.assertOtherPermission('execute', 'run commands on a host');
                         await confirm(
                             `Upgrade the adapter "${args.adapter}"${args.version ? ` to ${args.version}` : ''}?`,
                         );
@@ -2563,6 +2903,7 @@ export default class McpServer {
                 },
                 async args => {
                     try {
+                        await this.assertOtherPermission('execute', 'run commands on a host');
                         await confirm(
                             `Install the package "${args.source || args.file_path || args.file_name || args.upload_id}"? It runs with full rights on the host.`,
                         );
@@ -2692,6 +3033,7 @@ export default class McpServer {
                 },
                 async args => {
                     try {
+                        await this.assertOtherPermission('sendto', 'send messages to adapters');
                         await confirm('Run the code in the javascript adapter?');
                         return ok({ ok: true, data: await this.runScript(args) });
                     } catch (e) {
@@ -2732,6 +3074,7 @@ export default class McpServer {
                 },
                 async args => {
                     try {
+                        await this.assertOtherPermission('sendto', 'send messages to adapters');
                         await confirm(`Send "${args.command}" to "${args.instance}"?`);
                         return ok({ ok: true, data: await this.sendToInstance(args) });
                     } catch (e) {
@@ -2974,6 +3317,29 @@ export default class McpServer {
     }
 
     /**
+     * Verify a right of the "other" category of the user, like admin does for `cmdExec` (`execute`) and
+     * `sendTo` (`sendto`). js-controller does not check them for messages, so without this an MCP user
+     * could run what the ioBroker user may not.
+     *
+     * @param operation `execute` for CLI commands on a host, `sendto` for messages to adapters
+     * @param action what was denied, for the error message (e.g. `run "iobroker url ..." on host "x"`)
+     * @throws {Error} a permissionError before anything was done
+     */
+    private async assertOtherPermission(operation: 'execute' | 'sendto', action: string): Promise<void> {
+        if (this.user === 'system.user.admin') {
+            return;
+        }
+        const permissions = await this.adapter.calculatePermissionsAsync(this.user, []);
+        if (permissions.groups?.includes('system.group.administrator') || permissions.other?.[operation]) {
+            return;
+        }
+        throw new Error(
+            `permissionError: user "${this.user}" may not ${action} (missing "${operation}" in the ` +
+                '"other" permissions of its groups) - nothing was done',
+        );
+    }
+
+    /**
      * Verify that the user of the request may write every given state, mirroring the checks js-controller runs in
      * `setForeignState`: the user must be able to read the object (needed for the type coercion in
      * {@link setState}) and the state ACL must allow writing — for an alias also on its write target.
@@ -3164,9 +3530,35 @@ export default class McpServer {
         from_ts?: number;
         limit?: number;
         adapter?: string;
+        search?: string;
     }): Promise<{ logs: Record<string, unknown>[]; newestTs?: number; fileSize?: number }> {
         const limit = Math.max(1, params.limit || 200);
-        const filtering = !!((params.level && params.level.length) || params.adapter || params.from_ts !== undefined);
+        // `search` is a text (case-insensitive) or a regular expression written as /pattern/flags
+        let matches: ((message: string) => boolean) | undefined;
+        if (params.search) {
+            const regExp = params.search.match(/^\/(.+)\/([a-z]*)$/);
+            if (regExp) {
+                let pattern: RegExp;
+                try {
+                    // without g/y: test() would continue from the last match
+                    pattern = new RegExp(regExp[1], regExp[2].replace(/[gy]/g, ''));
+                } catch (e) {
+                    return Promise.reject(
+                        new Error(`Invalid regular expression ${params.search}: ${e instanceof Error ? e.message : e}`),
+                    );
+                }
+                matches = message => pattern.test(message);
+            } else {
+                const text = params.search.toLowerCase();
+                matches = message => message.toLowerCase().includes(text);
+            }
+        }
+        const filtering = !!(
+            (params.level && params.level.length) ||
+            params.adapter ||
+            params.from_ts !== undefined ||
+            matches
+        );
         // The host `getLogs` returns the tail of the log file (≈150 bytes per requested line). When a
         // filter is active, scan a much larger window so error/warn lines are not pushed out by a flood
         // of debug lines from a chatty adapter.
@@ -3205,6 +3597,9 @@ export default class McpServer {
                 if (params.adapter) {
                     const adapter = params.adapter;
                     logs = logs.filter(log => log.source === adapter || log.source.startsWith(`${adapter}.`));
+                }
+                if (matches) {
+                    logs = logs.filter(log => matches(log.message));
                 }
                 // Return the most recent `limit` matching lines.
                 if (logs.length > limit) {
@@ -3762,6 +4157,77 @@ export default class McpServer {
         return coerced;
     }
 
+    /**
+     * Read a state until `reached` accepts it, the time is up or the client cancels the call.
+     *
+     * @param id state ID
+     * @param reached the condition
+     * @param timeoutSeconds how long to wait at most
+     * @param signal aborted when the client cancels the call
+     * @returns whether the condition was met, the last read state and how long it took (ms)
+     */
+    private async waitForState(
+        id: string,
+        reached: (state: ioBroker.State | null | undefined) => boolean,
+        timeoutSeconds: number,
+        signal?: AbortSignal,
+    ): Promise<{ reached: boolean; state: ioBroker.State | null | undefined; waited: number }> {
+        const start = Date.now();
+        const deadline = start + timeoutSeconds * 1000;
+        for (;;) {
+            const state = await this.adapter.getForeignStateAsync(id, { user: this.user });
+            const done = reached(state);
+            if (done || Date.now() >= deadline || signal?.aborted) {
+                return { reached: done, state, waited: Date.now() - start };
+            }
+            await new Promise(resolve => setTimeout(resolve, Math.min(STATE_POLL_INTERVAL, deadline - Date.now())));
+        }
+    }
+
+    /**
+     * Whether a state value is the expected one, also if one of them is stored as a string ("21.5" and 21.5,
+     * '{"a":1}' and {a: 1}).
+     */
+    private static sameValue(actual: unknown, expected: unknown): boolean {
+        if (actual === null || actual === undefined || expected === null || expected === undefined) {
+            return actual === expected;
+        }
+        const text = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value));
+        return text(actual) === text(expected);
+    }
+
+    /**
+     * The states without object. For a pattern, js-controller returns only the states of existing state objects,
+     * except in its maintenance mode (only for the admin user), which reads the keys of the states database. The
+     * objects are read with the rights of the adapter, as an object the user may not see is still an object. A
+     * state without object has no ACL, so js-controller lets every user read it anyway.
+     *
+     * @param pattern IDs of the states to check, wildcards allowed
+     * @returns how many states were checked, and the states without object
+     */
+    private async findOrphanStates(pattern: string): Promise<{ checked: number; orphans: Record<string, unknown>[] }> {
+        // not a literal argument: the types of the adapter do not know `maintenance`
+        const maintenance = { user: 'system.user.admin', maintenance: true } as const;
+        const states = await this.adapter.getForeignStatesAsync(pattern, maintenance);
+        // The state objects of all IDs the pattern may match
+        const prefix = pattern.split('*')[0];
+        const view = await this.adapter.getObjectViewAsync('system', 'state', {
+            startkey: prefix,
+            endkey: `${prefix}香`,
+        });
+        const objects = new Set(view.rows.map(row => row.id));
+        const orphans: Record<string, unknown>[] = [];
+        for (const id of Object.keys(states).sort()) {
+            // the rare state of an object of another type is no orphan either
+            if (objects.has(id) || (await this.adapter.getForeignObjectAsync(id))) {
+                continue;
+            }
+            const state = states[id];
+            orphans.push({ id, val: state?.val, ack: state?.ack, ts: state?.ts, from: state?.from });
+        }
+        return { checked: Object.keys(states).length, orphans };
+    }
+
     /** Coerce an arbitrary value to the given ioBroker state type. */
     private static coerceValue(value: unknown, type: ioBroker.CommonType | undefined): ioBroker.StateValue {
         if (value === null || value === undefined) {
@@ -4142,19 +4608,33 @@ export default class McpServer {
         const adapterName = extractAdapterName(
             params.file_path || params.file_name || upload?.name || params.source || '',
         );
+        // The package is installed at this point: errors from here on are reported, not thrown, so the
+        // caller still learns that the installation happened
         const restartTs = Date.now();
-        const restarted =
-            result.success && adapterName && params.restart_instances !== false
-                ? await this.restartAdapterInstances(adapterName)
-                : [];
+        const restarted: string[] = [];
+        let restartError: string | undefined;
+        if (result.success && adapterName && params.restart_instances !== false) {
+            try {
+                await this.restartAdapterInstances(adapterName, restarted);
+            } catch (e) {
+                restartError = `Installed, but the instances could not be restarted: ${e instanceof Error ? e.message : e}`;
+            }
+        }
         const startTimeout = params.start_timeout ?? DEFAULT_START_TIMEOUT;
+        let instances: Record<string, unknown>[] | undefined;
+        if (restarted.length && startTimeout) {
+            try {
+                instances = await this.waitForStart(restarted, restartTs, startTimeout);
+            } catch (e) {
+                restartError ??= `Installed, but the start of the instances could not be checked: ${e instanceof Error ? e.message : e}`;
+            }
+        }
         return {
             ...result,
             adapter: adapterName,
             restartedInstances: restarted,
-            ...(restarted.length && startTimeout
-                ? { instances: await this.waitForStart(restarted, restartTs, startTimeout) }
-                : {}),
+            ...(restartError ? { restartError } : {}),
+            ...(instances ? { instances } : {}),
         };
     }
 
@@ -4241,6 +4721,7 @@ export default class McpServer {
         timeoutSeconds?: number,
         files?: { name: string; file: string }[],
     ): Promise<Record<string, unknown> & { success?: boolean }> {
+        await this.assertOtherPermission('execute', `run "iobroker ${command}" on host "${host}"`);
         const id = `mcp-${randomUUID()}`;
         const timeout = (timeoutSeconds ?? DEFAULT_INSTALL_TIMEOUT) * 1000;
         const output: string[] = [];
@@ -4289,19 +4770,22 @@ export default class McpServer {
         });
     }
 
-    /** Like admin after an installation: touching the instance objects makes the controller restart them. */
-    private async restartAdapterInstances(adapterName: string): Promise<string[]> {
+    /**
+     * Like admin after an installation: touching the instance objects makes the controller restart them.
+     *
+     * @param adapterName adapter whose enabled instances are restarted
+     * @param restarted receives the ids of the restarted instances, also those before an error
+     */
+    private async restartAdapterInstances(adapterName: string, restarted: string[]): Promise<void> {
         const instances = await this.adapter.getForeignObjectsAsync(`system.adapter.${adapterName}.*`, 'instance', {
             user: this.user,
         });
-        const restarted: string[] = [];
         for (const [instanceId, instance] of Object.entries(instances || {})) {
             if (instance?.common?.enabled) {
                 await this.adapter.extendForeignObjectAsync(instanceId, {}, { user: this.user });
                 restarted.push(instanceId.replace('system.adapter.', ''));
             }
         }
-        return restarted;
     }
 
     /** Read an instance object by its short id (`hue.0`) or full id (`system.adapter.hue.0`). */
@@ -4670,6 +5154,7 @@ export default class McpServer {
         instance?: string;
     }): Promise<Record<string, unknown>> {
         const instance = await this.getInstance(params.instance || 'javascript.0');
+        await this.assertOtherPermission('sendto', `run code in "${instance.id}"`);
         const timeout = params.timeout ?? 5000;
         const result = await this.adapter.sendToAsync(
             instance.id,
@@ -4703,6 +5188,7 @@ export default class McpServer {
         if (!this.isSendToAllowed(instance.id)) {
             throw new Error(`"${instance.id}" is not in the allowlist of send_to`);
         }
+        await this.assertOtherPermission('sendto', `send messages to "${instance.id}"`);
         const response = await this.adapter.sendToAsync(
             instance.id,
             params.command,

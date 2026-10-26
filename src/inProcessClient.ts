@@ -96,7 +96,7 @@ export interface InProcessMcpOptions {
 
 /** A ready-to-use in-process MCP connection: list tools, call them, and close everything. */
 export interface InProcessMcp {
-    /** List the available tools (already filtered by the configured permission toggles). */
+    /** List the available tools (already filtered by the configured permission toggles and the user rights). */
     listTools(): Promise<InProcessToolInfo[]>;
     /** Call a tool by name with the given arguments; returns its text result. */
     callTool(name: string, args?: Record<string, unknown>): Promise<InProcessToolResult>;
@@ -121,6 +121,7 @@ export async function createInProcessMcp(options: InProcessMcpOptions): Promise<
     const mcp = McpServer.createEmbedded(embedOptions);
 
     const server = mcp.createInProcessServer();
+    await mcp.hideToolsWithoutRights(server);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
 

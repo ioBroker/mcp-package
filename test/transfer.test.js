@@ -188,6 +188,9 @@ describe('download and upload links', () => {
     });
 
     it('lets only the user that created an upload use it', async () => {
+        for (const user of ['system.user.alice', 'system.user.bob']) {
+            ctx.permissions[user] = { user, groups: ['system.group.user'], file: { read: true, write: true } };
+        }
         const callA = await ctx.sessionOf('alice');
         const callB = await ctx.sessionOf('bob');
         const { json } = await callA('prepare_upload', { name: 'data.bin' });

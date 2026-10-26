@@ -5,11 +5,16 @@ const { createMockAdapter } = require('./mockAdapter');
 /**
  * Start an in-process MCP server on top of a fresh mock adapter.
  *
- * @param options overrides for `createInProcessMcp` (by default every tool is enabled)
+ * @param options overrides for `createInProcessMcp` (by default every tool is enabled), and `permissions`: the
+ *   rights of `defaultUser`, which decide about the offered tools already when the session starts
  * @returns the connection plus the mock's in-memory stores
  */
 async function startMcp(options = {}) {
+    const { permissions, ...mcpOptions } = options;
     const mock = createMockAdapter();
+    if (permissions) {
+        mock.permissions[mcpOptions.defaultUser] = permissions;
+    }
     const mcp = await createInProcessMcp({
         adapter: mock.adapter,
         language: 'en',
@@ -21,7 +26,7 @@ async function startMcp(options = {}) {
         allowScriptChange: true,
         sendToAllowlist: 'telegram, backitup.0',
         clientName: 'mcp-test-client',
-        ...options,
+        ...mcpOptions,
     });
     return { ...mock, mcp };
 }

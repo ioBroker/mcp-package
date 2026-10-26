@@ -23,6 +23,7 @@ const ALL_TOOLS = [
     'delete_script',
     'enable_script',
     'file_exists',
+    'find_orphan_states',
     'get_logs',
     'get_object',
     'get_script',
@@ -57,6 +58,7 @@ const ALL_TOOLS = [
     'stop_instance',
     'system_info',
     'upgrade_adapter',
+    'wait_for_state',
     'write_file',
     'write_log',
 ];
@@ -120,6 +122,8 @@ const READ_ONLY_TOOLS = [
     'list_notifications',
     'list_scripts',
     'get_script',
+    'wait_for_state',
+    'find_orphan_states',
 ];
 
 describe('tool metadata', () => {

@@ -4,6 +4,8 @@
  */
 const assert = require('node:assert/strict');
 const net = require('node:net');
+const { McpServer } = require('../build/index.js');
+const { createMockAdapter } = require('./mockAdapter');
 const { startMcp, call, callOk } = require('./helpers');
 
 /** Format a time like js-controller does in the log file (local time). */
@@ -94,6 +96,22 @@ describe('reading tools', () => {
         const data = await callOk(ctx.mcp, 'get_logs', { adapter: 'hue.0' });
         assert.equal(data.logs.length, 2);
         assert.ok(data.logs.every(entry => entry.source === 'hue.0'));
+    });
+
+    it('get_logs searches the messages for a text or a regular expression', async () => {
+        const text = await callOk(ctx.mcp, 'get_logs', { search: 'BRIDGE' });
+        assert.deepEqual(
+            text.logs.map(entry => entry.message),
+            ['hue.0 (1235) Bridge answered slowly'],
+        );
+        const regExp = await callOk(ctx.mcp, 'get_logs', { search: '/init not|listening/i' });
+        assert.deepEqual(
+            regExp.logs.map(entry => entry.source),
+            ['hm-rpc.0', 'admin.0'],
+        );
+        const invalid = await call(ctx.mcp, 'get_logs', { search: '/(/' });
+        assert.equal(invalid.isError, true);
+        assert.match(invalid.json.error, /Invalid regular expression/);
     });
 
     it('system_info reports the js-controller version and instance count', async () => {
@@ -400,6 +418,51 @@ describe('writing tools', () => {
         assert.equal(ctx.states['hue.0.light.state'].ack, true);
     });
 
+    /**
+     * Let a simulated device adapter confirm every command after a delay.
+     *
+     * @param delay ms until the confirmation
+     * @param value the confirmed value (default: the commanded one)
+     */
+    function confirmCommands(delay, value) {
+        const setForeignStateAsync = ctx.adapter.setForeignStateAsync;
+        ctx.adapter.setForeignStateAsync = async (id, val, ack, options) => {
+            await setForeignStateAsync(id, val, ack, options);
+            if (!ack) {
+                setTimeout(() => setForeignStateAsync(id, value === undefined ? val : value, true), delay);
+            }
+        };
+    }
+
+    it('set_state waits for the confirmation of the device with wait_ack', async () => {
+        // the device limits the brightness
+        confirmCommands(300, 80);
+        const data = await callOk(ctx.mcp, 'set_state', { id: 'hue.0.light.brightness', value: 100, wait_ack: 5 });
+        assert.equal(data.value, 100);
+        assert.equal(data.acked, true);
+        assert.equal(data.state.val, 80);
+        assert.equal(data.state.ack, true);
+        assert.ok(data.waited_ms >= 250, `confirmed after ${data.waited_ms} ms already`);
+    });
+
+    it('set_state reports a command that was not confirmed in time', async () => {
+        const data = await callOk(ctx.mcp, 'set_state', { id: 'hue.0.light.state', value: true, wait_ack: 0.3 });
+        assert.equal(data.value, true);
+        assert.equal(data.acked, false);
+        assert.equal(data.state.ack, false);
+        assert.match(data.hint, /not confirmed within 0\.3 s/);
+    });
+
+    it('set_state does not wait for a value written with ack=true', async () => {
+        const data = await callOk(ctx.mcp, 'set_state', {
+            id: 'hue.0.light.state',
+            value: true,
+            options: { ack: true },
+            wait_ack: 5,
+        });
+        assert.deepEqual(data, { id: 'hue.0.light.state', value: true });
+    });
+
     it('set_states writes a group in one call', async () => {
         const data = await callOk(ctx.mcp, 'set_states', {
             states: [
@@ -525,13 +588,15 @@ describe('set_states permissions', () => {
     }
 
     beforeEach(async () => {
-        ctx = await startMcp({ defaultUser: user });
-        ctx.permissions[user] = {
-            user,
-            groups: ['system.group.mcp'],
-            object: { read: true, list: true },
-            state: { read: true, list: true, write: true },
-        };
+        ctx = await startMcp({
+            defaultUser: user,
+            permissions: {
+                user,
+                groups: ['system.group.mcp'],
+                object: { read: true, list: true },
+                state: { read: true, list: true, write: true },
+            },
+        });
         protect('hue.0.light.state', 'system.group.mcp');
         protect('hue.0.light.brightness', 'system.group.administrator');
     });
@@ -570,7 +635,8 @@ describe('set_states permissions', () => {
         assert.equal(ctx.states['hue.0.light.brightness'].val, 42);
     });
 
-    it('rejects the batch if the user has no state write permission at all', async () => {
+    it('rejects the batch if the user has no state write permission (any more)', async () => {
+        // withdrawn after the tool was offered
         ctx.permissions[user].state.write = false;
         const result = await call(ctx.mcp, 'set_states', { states: [{ id: 'hue.0.light.state', value: true }] });
         assert.equal(result.isError, true);
@@ -1160,6 +1226,382 @@ describe('send_to', () => {
             assert.match(result.json.error, /allowlist/);
         }
         assert.equal(ctx.messages.sent.length, 0);
+    });
+});
+
+describe('"other" permissions of the user', () => {
+    const user = 'system.user.mcp';
+    let ctx;
+
+    beforeEach(async () => {
+        // The tools are offered at the start; the tests withdraw the rights afterwards, as an administrator may do
+        // during a session, to check the calls themselves
+        ctx = await startMcp({
+            defaultUser: user,
+            permissions: {
+                user,
+                groups: ['system.group.user'],
+                object: { read: true, list: true, write: true },
+                state: { read: true, list: true, write: true },
+                other: { execute: true, http: true, sendto: true },
+            },
+        });
+        for (const id of ['hue.0', 'telegram.0', 'javascript.0']) {
+            ctx.objects[`system.adapter.${id}`] = {
+                _id: `system.adapter.${id}`,
+                type: 'instance',
+                common: { name: id.split('.')[0], enabled: true, host: 'testhost' },
+                native: {},
+            };
+        }
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('runs no host command without "execute"', async () => {
+        ctx.permissions[user].other.execute = false;
+        for (const [tool, args] of [
+            ['install_package', { source: 'hue' }],
+            ['add_instance', { adapter: 'hue' }],
+            ['delete_instance', { id: 'hue.0' }],
+        ]) {
+            const result = await call(ctx.mcp, tool, args);
+            assert.equal(result.isError, true, `${tool} was allowed`);
+            assert.match(result.json.error, /permissionError: user "system\.user\.mcp" may not .*"execute"/);
+        }
+        assert.equal(ctx.cmdExec.sent.length, 0);
+        assert.deepEqual(ctx.extended, []);
+    });
+
+    it('runs host commands with "execute"', async () => {
+        const data = await callOk(ctx.mcp, 'install_package', { source: 'hue', start_timeout: 1 });
+        assert.equal(data.success, true);
+        assert.equal(ctx.cmdExec.sent.length, 1);
+    });
+
+    it('runs host commands for administrators', async () => {
+        ctx.permissions[user].other.execute = false;
+        ctx.permissions[user].groups = ['system.group.administrator'];
+        await callOk(ctx.mcp, 'install_package', { source: 'hue', start_timeout: 1 });
+        assert.equal(ctx.cmdExec.sent.length, 1);
+    });
+
+    it('sends no messages and runs no code without "sendto"', async () => {
+        ctx.permissions[user].other.sendto = false;
+        for (const [tool, args] of [
+            ['send_to', { instance: 'telegram.0', command: 'send', message: { text: 'Hi' } }],
+            ['run_script', { source: 'log(1)', timeout: 100 }],
+        ]) {
+            const result = await call(ctx.mcp, tool, args);
+            assert.equal(result.isError, true, `${tool} was allowed`);
+            assert.match(result.json.error, /permissionError: .*"sendto"/);
+        }
+        assert.equal(ctx.messages.sent.length, 0);
+    });
+
+    it('sends messages with "sendto"', async () => {
+        await callOk(ctx.mcp, 'send_to', { instance: 'telegram.0', command: 'send', message: { text: 'Hi' } });
+        assert.equal(ctx.messages.sent.length, 1);
+    });
+
+    it('reports an installation whose instances could not be restarted', async () => {
+        ctx.adapter.extendForeignObjectAsync = () => Promise.reject(new Error('permissionError'));
+        const data = await callOk(ctx.mcp, 'install_package', { source: 'hue' });
+        assert.equal(data.success, true);
+        assert.equal(data.exitCode, 0);
+        assert.deepEqual(data.restartedInstances, []);
+        assert.match(data.restartError, /^Installed, but the instances could not be restarted: permissionError/);
+    });
+});
+
+describe('tools offered by the rights of the user', () => {
+    const user = 'system.user.mcp';
+    /** The writing tools a user needs a general right of its groups for */
+    const RIGHTFUL_TOOLS = [
+        'set_state',
+        'set_states',
+        'set_object',
+        'create_state',
+        'create_scene',
+        'create_alias',
+        'delete_object',
+        'write_file',
+        'rename_file',
+        'mkdir',
+        'delete_file',
+        'start_instance',
+        'stop_instance',
+        'restart_instance',
+        'set_log_level',
+        'add_instance',
+        'delete_instance',
+        'upgrade_adapter',
+        'install_package',
+        'set_script',
+        'enable_script',
+        'delete_script',
+        'run_script',
+        'send_to',
+    ];
+    let ctx;
+
+    afterEach(async () => {
+        await ctx?.mcp.close();
+        ctx = undefined;
+    });
+
+    const offeredTools = async () => (await ctx.mcp.listTools()).map(tool => tool.name);
+
+    it('offers a user who may only read no tool that needs a right', async () => {
+        ctx = await startMcp({
+            defaultUser: user,
+            permissions: {
+                user,
+                groups: ['system.group.user'],
+                object: { read: true, list: true, write: false, delete: false },
+                state: { read: true, list: true, write: false, delete: false },
+                file: { read: true, list: true, write: false, delete: false },
+                other: { execute: false, http: true, sendto: false },
+            },
+        });
+        const offered = await offeredTools();
+        assert.deepEqual(
+            RIGHTFUL_TOOLS.filter(name => offered.includes(name)),
+            [],
+        );
+        for (const name of ['get_states', 'wait_for_state', 'find_orphan_states', 'check_permissions', 'write_log']) {
+            assert.ok(offered.includes(name), `${name} is not offered`);
+        }
+        assert.ok(
+            ctx.logged.some(
+                entry => entry.level === 'debug' && /^MCP tools not offered to system\.user\.mcp/.test(entry.message),
+            ),
+            'the hidden tools are not logged',
+        );
+    });
+
+    it('offers the tools of the granted rights', async () => {
+        ctx = await startMcp({
+            defaultUser: user,
+            permissions: { user, groups: ['system.group.user'], state: { write: true }, other: { execute: true } },
+        });
+        const offered = await offeredTools();
+        assert.deepEqual(
+            RIGHTFUL_TOOLS.filter(name => offered.includes(name)),
+            [
+                'set_state',
+                'set_states',
+                'set_log_level',
+                'add_instance',
+                'delete_instance',
+                'upgrade_adapter',
+                'install_package',
+            ],
+        );
+    });
+
+    it('refuses a call of a tool that is not offered', async () => {
+        ctx = await startMcp({ defaultUser: user, permissions: { user, groups: [] } });
+        const result = await ctx.mcp.callTool('set_state', { id: 'hue.0.light.state', value: true });
+        assert.equal(result.isError, true);
+        assert.match(result.text, /disabled/);
+        assert.equal(ctx.states['hue.0.light.state'].val, false);
+    });
+
+    it('offers administrators every tool', async () => {
+        ctx = await startMcp({ defaultUser: user, permissions: { user, groups: ['system.group.administrator'] } });
+        const offered = await offeredTools();
+        assert.deepEqual(
+            RIGHTFUL_TOOLS.filter(name => !offered.includes(name)),
+            [],
+        );
+    });
+
+    it('offers every tool if the rights cannot be read', async () => {
+        const { adapter, logged } = createMockAdapter();
+        adapter.calculatePermissionsAsync = () => Promise.reject(new Error('no database'));
+        const mcp = McpServer.createEmbedded({ adapter, defaultUser: user });
+        try {
+            assert.deepEqual(await mcp.hideToolsWithoutRights(mcp.createInProcessServer()), []);
+            assert.ok(
+                logged.some(
+                    entry => entry.level === 'warn' && /rights of system\.user\.mcp.*no database/.test(entry.message),
+                ),
+                'the failure is not logged',
+            );
+        } finally {
+            mcp.unload();
+        }
+    });
+});
+
+describe('wait_for_state', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    /**
+     * Write a state like an adapter, later.
+     *
+     * @param delay ms until the write
+     * @param id state ID
+     * @param val the value
+     * @param ack the acknowledge flag
+     */
+    const writeLater = (delay, id, val, ack = true) =>
+        setTimeout(() => ctx.adapter.setForeignStateAsync(id, val, ack), delay);
+
+    it('waits until the state has the value', async () => {
+        writeLater(100, 'hue.0.light.brightness', 50);
+        writeLater(400, 'hue.0.light.brightness', 80);
+        const data = await callOk(ctx.mcp, 'wait_for_state', { id: 'hue.0.light.brightness', value: '80', timeout: 5 });
+        assert.equal(data.reached, true);
+        assert.equal(data.state.val, 80);
+        assert.ok(data.waited_ms >= 350, `reached after ${data.waited_ms} ms already`);
+    });
+
+    it('returns at once if the state has the value already', async () => {
+        const data = await callOk(ctx.mcp, 'wait_for_state', { id: 'hue.0.light.state', value: 'false' });
+        assert.equal(data.reached, true);
+        assert.equal(data.waited_ms < 200, true);
+    });
+
+    it('waits for the next update without a value', async () => {
+        // the same value again
+        writeLater(300, 'hue.0.light.brightness', 42);
+        const data = await callOk(ctx.mcp, 'wait_for_state', { id: 'hue.0.light.brightness', timeout: 5 });
+        assert.equal(data.reached, true);
+        assert.equal(data.state.val, 42);
+        assert.ok(data.waited_ms >= 250, `reached after ${data.waited_ms} ms already`);
+    });
+
+    it('accepts only a state with the requested ack', async () => {
+        writeLater(100, 'hue.0.light.state', true, false);
+        writeLater(400, 'hue.0.light.state', true, true);
+        const data = await callOk(ctx.mcp, 'wait_for_state', {
+            id: 'hue.0.light.state',
+            value: true,
+            ack: true,
+            timeout: 5,
+        });
+        assert.equal(data.reached, true);
+        assert.equal(data.state.ack, true);
+        assert.ok(data.waited_ms >= 350, `reached after ${data.waited_ms} ms already`);
+    });
+
+    it('gives up after the timeout', async () => {
+        const data = await callOk(ctx.mcp, 'wait_for_state', { id: 'hue.0.light.state', value: true, timeout: 0.3 });
+        assert.equal(data.reached, false);
+        assert.equal(data.state.val, false);
+        assert.match(data.hint, /not reached within 0\.3 s/);
+        assert.ok(data.waited_ms >= 300, `gave up after ${data.waited_ms} ms already`);
+    });
+
+    it('refuses to wait longer than clients wait for an answer', async () => {
+        const result = await ctx.mcp.callTool('wait_for_state', { id: 'hue.0.light.state', timeout: 120 });
+        assert.equal(result.isError, true);
+    });
+});
+
+describe('find_orphan_states', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+        // The states of admin.0 have objects, those of scene.0 and of the deleted vis.0 not
+        for (const id of ['system.adapter.admin.0.alive', 'system.adapter.admin.0.connected']) {
+            ctx.objects[id] = { _id: id, type: 'state', common: { name: id, type: 'boolean' }, native: {} };
+        }
+        ctx.states['system.adapter.vis.0.alive'] = {
+            val: false,
+            ack: true,
+            ts: 1_700_000_000_000,
+            from: 'system.host.testhost',
+        };
+        // the state of an object of another type is no orphan
+        ctx.states['system.adapter.scene.0'] = { val: 1, ack: true, ts: 1_700_000_000_000 };
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('finds the states without object', async () => {
+        const data = await callOk(ctx.mcp, 'find_orphan_states', { pattern: 'system.adapter.*' });
+        assert.equal(data.checked, 5);
+        assert.deepEqual(data.orphans, [
+            { id: 'system.adapter.scene.0.alive', val: true, ack: true, ts: 1_750_000_000_000 },
+            {
+                id: 'system.adapter.vis.0.alive',
+                val: false,
+                ack: true,
+                ts: 1_700_000_000_000,
+                from: 'system.host.testhost',
+            },
+        ]);
+    });
+
+    it('checks patterns with a wildcard inside and single states', async () => {
+        const alive = await callOk(ctx.mcp, 'find_orphan_states', { pattern: 'system.adapter.*.alive' });
+        assert.deepEqual(
+            alive.orphans.map(orphan => orphan.id),
+            ['system.adapter.scene.0.alive', 'system.adapter.vis.0.alive'],
+        );
+        const single = await callOk(ctx.mcp, 'find_orphan_states', { pattern: 'hue.0.light.state' });
+        assert.equal(single.checked, 1);
+        assert.deepEqual(single.orphans, []);
+    });
+});
+
+describe('log of the tool calls', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+        ctx.objects['system.adapter.hue.0'] = {
+            _id: 'system.adapter.hue.0',
+            type: 'instance',
+            common: { name: 'hue', enabled: true },
+            native: {},
+        };
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    const mcpLines = level => ctx.logged.filter(entry => entry.level === level && entry.message.startsWith('MCP '));
+
+    it('logs a failed call with the tool and its arguments, without the message payload', async () => {
+        await call(ctx.mcp, 'send_to', { instance: 'hue.0', command: 'x', message: { password: 'secret' } });
+        const [line] = mcpLines('warn');
+        assert.match(
+            line.message,
+            /^MCP tool error in send_to\(instance="hue\.0", command="x", message=<\d+ chars>\) by system\.user\.admin: .*allowlist/,
+        );
+        assert.doesNotMatch(line.message, /secret/);
+    });
+
+    it('logs who changed what at info level', async () => {
+        await callOk(ctx.mcp, 'set_state', { id: 'hue.0.light.state', value: true });
+        assert.deepEqual(
+            mcpLines('info').map(entry => entry.message),
+            ['MCP system.user.admin: set_state(id="hue.0.light.state", value=true)'],
+        );
+    });
+
+    it('does not log reading calls', async () => {
+        await callOk(ctx.mcp, 'get_states', { ids: ['hue.0.light.state'] });
+        assert.deepEqual(mcpLines('info'), []);
+        assert.deepEqual(mcpLines('warn'), []);
     });
 });
 

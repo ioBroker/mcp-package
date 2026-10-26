@@ -157,6 +157,27 @@ All options that change the system are **off** by default; turn on only what the
   `.tgz` on a test system. An installed package runs with full rights on the host, so never enable it on a
   productive system or for clients you do not fully trust.
 
+**Rights of the ioBroker user**
+The options above decide which tools exist; what a call may do is decided by the rights of the ioBroker user the
+MCP session runs as (the logged-in user, or the Default User without authentication), like in ioBroker.admin:
+- the ACLs of objects, states and files for reading and writing them,
+- the "other" rights of the user's groups: **execute** for commands on a host (`install_package`, `add_instance`,
+  `delete_instance`, `upgrade_adapter`) and **sendto** for messages to adapters (`send_to`, `run_script`).
+  Without them the call is refused before anything runs. Administrators have all rights.
+
+A session is not even offered the tools that need a right the groups of its user lack: without the write right for
+states no `set_state`/`set_states`, without the write right for objects no `set_object`, `create_state`,
+`start_instance`, ..., without the write right for files no `write_file`, without **execute** no `install_package`,
+without **sendto** no `send_to`. The rights are read when the session starts; every call is checked anyway.
+
+`check_permissions` shows these rights and the ACLs of given objects.
+
+**Log**
+Every call of a changing tool is logged at info level with the user, the tool and its arguments
+(`MCP system.user.admin: set_state(id="hue.0.light.state", value=true)`), and every failed call as a warning with
+the same details. Long values are shortened; file contents, script code and `send_to` payloads are replaced by
+their size.
+
 ### SSL/TLS Configuration
 - **Enable HTTPS**: Enable HTTPS/SSL for secure connections
 - **Public Certificate**: Path to the public certificate file
@@ -178,6 +199,8 @@ Point your MCP client at:
 | Tool                        | Description                                                                                                                                                                                                                                          |
 |-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `get_states`                | Retrieve the current value of one or multiple states; IDs may contain wildcards (e.g. `hue.0.*.brightness`); an ID without a state is returned with `exists: false` or a hint                                                                      |
+| `wait_for_state`            | Wait until a state has a `value` (or, without `value`, until it is updated), optionally only with `ack`; gives up after `timeout` seconds (default 30, at most 50) with `reached: false`                                                             |
+| `find_orphan_states`        | Find states without object (e.g. `system.adapter.vis.0.alive` of a deleted instance) by an ID `pattern`; delete them on the host with `iobroker state del <id>`                                                                                      |
 | `get_object`                | Read a single object by its ID                                                                                                                                                                                                                       |
 | `check_permissions`         | Show the user and groups of the MCP session, the rights of its groups and, for given object IDs, whether it may read/write/delete the object and read/write the state                                                                               |
 | `search_objects`            | Search objects/states by keyword (matched against ID and name); optional filters for object `type`, `role`, `room` and source `adapter` instance                                                                                                     |
@@ -192,7 +215,7 @@ Point your MCP client at:
 | `read_file`                 | Read a file from an adapter file storage (optional base64); large files are read in chunks via `offset`/`length` (default 512 KiB per call) — the result carries `size`, `truncated` and `nextOffset`; `download: true` returns a download link instead |
 | `list_files`                | List a directory in an adapter file storage                                                                                                                                                                                                          |
 | `file_exists`               | Check whether a file exists in an adapter file storage                                                                                                                                                                                               |
-| `get_logs`                  | Retrieve recent ioBroker log lines; optional filters by `level` (error/warn/info/debug), source `adapter` and start time (`from_ts`); `logFile` tells the time of the newest line and the file size                                                                                                                 |
+| `get_logs`                  | Retrieve recent ioBroker log lines; optional filters by `level` (error/warn/info/debug), source `adapter`, start time (`from_ts`) and `search` in the message (text, or `/regex/flags`); `logFile` tells the time of the newest line and the file size                                                            |
 | `write_log`                 | Write a message to the ioBroker log                                                                                                                                                                                                                  |
 | `system_info`               | Get system and js-controller information                                                                                                                                                                                                             |
 | `list_adapter_updates`      | List installed adapters that have a newer version in the active repository                                                                                                                                                                           |
@@ -200,7 +223,7 @@ Point your MCP client at:
 | `list_scripts`              | List the scripts of the javascript adapter (without source)                                                                                                                                                                                          |
 | `get_script`                | Read a script including its source                                                                                                                                                                                                                   |
 | `ping_host`                 | Diagnose connectivity to a network device: ICMP ping to `host` plus an optional TCP connect to `port` — useful to investigate adapter `ETIMEDOUT`/connection errors                                                                                  |
-| `set_state`                 | Set the value of a state (value coerced to the state type) — requires *Allow setting states*                                                                                                                                                         |
+| `set_state`                 | Set the value of a state (value coerced to the state type); with `wait_ack` (seconds) it waits until the device confirms the command (`ack: true`) and returns the confirmed state — requires *Allow setting states*                                 |
 | `set_states`                | Set multiple states in one call (for scenes/group actions like "all lights off") — requires *Allow setting states*                                                                                                                                   |
 | `clear_notifications`       | Acknowledge system notifications, optionally of one scope/category/instance — requires *Allow setting states*                                                                                                                                        |
 | `set_object`                | Create/update an object (merges common/native) — requires *Allow object/file changes*                                                                                                                                                                |
@@ -227,8 +250,9 @@ Point your MCP client at:
 | `run_script`                | Run code once in the javascript adapter and return its log output (javascript ≥ 10.1.0) — requires *Allow changing scripts*                                                                                                                          |
 | `send_to`                   | Send a message to an adapter instance (`sendTo`) and return the answer — only instances in *Allow messages to adapters*                                                                                                                              |
 
-All object/state access runs with the permissions of the configured **Default User**. The write tools are only
-registered when their respective permission option is enabled.
+All object/state access runs with the permissions of the user of the session (the logged-in user or the
+configured **Default User**). The write tools are only registered when their respective permission option is
+enabled, and only offered to users whose groups have the rights they need.
 
 Every tool declares a JSON input schema and all four MCP behaviour hints (`readOnlyHint`, `destructiveHint`,
 `idempotentHint`, `openWorldHint`), so a host can tell what a tool does before calling it and can ask the user
@@ -311,6 +335,16 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Security: commands on a host (`install_package`, `add_instance`, `delete_instance`, `upgrade_adapter`) require the "execute" right of the user, messages to adapters (`send_to`, `run_script`) the "sendto" right, like in admin. Before, they ran with the rights of the adapter
+* (@GermanBluefox) `install_package` reports a done installation even if the instances could not be restarted afterwards (`restartError`), instead of failing
+* (@GermanBluefox) Every call of a changing tool is logged with the user, the tool and its arguments; a failed call names the tool and its arguments
+* (@GermanBluefox) `get_logs` searches the messages for a text or a regular expression (`search`)
+* (@GermanBluefox) A session is only offered the tools its user has the rights for, e.g. no `install_package` without "execute"
+* (@GermanBluefox) `set_state` waits for the confirmation of the device with `wait_ack` and returns the confirmed state
+* (@GermanBluefox) Added the `wait_for_state` tool: waits until a state has a value or is updated
+* (@GermanBluefox) Added the `find_orphan_states` tool: finds states without object, e.g. of deleted instances
+
 ### 1.7.1 (2026-10-26)
 * (@GermanBluefox) Fixed: `get_logs` always returned `size: null` for the log file, because the host sends the size as a string
 

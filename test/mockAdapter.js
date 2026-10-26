@@ -328,11 +328,13 @@ function createMockAdapter() {
         getForeignStateAsync(id) {
             return Promise.resolve(states[id] ? { ...states[id] } : null);
         },
-        getForeignStatesAsync(pattern) {
+        getForeignStatesAsync(pattern, options) {
             const regExp = patternToRegExp(pattern);
+            // Like js-controller: only the states of state objects, all states only in maintenance mode for admin
+            const all = !!(options && options.maintenance && options.user === 'system.user.admin');
             const result = {};
             for (const [id, state] of Object.entries(states)) {
-                if (regExp.test(id)) {
+                if (regExp.test(id) && (all || (objects[id] && objects[id].type === 'state'))) {
                     result[id] = { ...state };
                 }
             }

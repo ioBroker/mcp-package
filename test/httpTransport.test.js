@@ -115,7 +115,12 @@ describe('User of the requests', () => {
     const readBy = [];
 
     before(async () => {
-        const { adapter } = createMockAdapter();
+        const { adapter, permissions } = createMockAdapter();
+        permissions['system.user.operator'] = {
+            user: 'system.user.operator',
+            groups: ['system.group.user'],
+            state: { read: true, list: true, write: true },
+        };
         const getForeignStateAsync = adapter.getForeignStateAsync.bind(adapter);
         adapter.getForeignStateAsync = (id, options) => {
             readBy.push(options && options.user);
@@ -187,6 +192,19 @@ describe('User of the requests', () => {
     it('runs the tools with the default user of the web instance without login', async () => {
         const sessionId = await initialize();
         assert.deepEqual(await readState(undefined, sessionId), ['system.user.guest']);
+    });
+
+    it('offers the session of each user the tools of its rights', async () => {
+        const listTools = async user => {
+            const sessionId = await initialize(user);
+            const list = await send(user, sessionId, { jsonrpc: '2.0', id: 5, method: 'tools/list' });
+            assert.equal(list.status, 200, list.text);
+            return list.text;
+        };
+        assert.match(await listTools('operator'), /"name":"set_state"/);
+        const guest = await listTools();
+        assert.match(guest, /"name":"get_states"/);
+        assert.doesNotMatch(guest, /"name":"set_state"/);
     });
 
     it('answers requests of another user to a session with 404', async () => {
