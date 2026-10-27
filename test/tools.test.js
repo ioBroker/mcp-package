@@ -1327,6 +1327,7 @@ describe('tools offered by the rights of the user', () => {
         'create_scene',
         'create_alias',
         'delete_object',
+        'delete_orphan_states',
         'write_file',
         'rename_file',
         'mkdir',
@@ -1563,6 +1564,86 @@ describe('find_orphan_states', () => {
     });
 });
 
+describe('delete_orphan_states', () => {
+    let ctx;
+
+    beforeEach(async () => {
+        ctx = await startMcp();
+        ctx.objects['system.adapter.admin.0.alive'] = {
+            _id: 'system.adapter.admin.0.alive',
+            type: 'state',
+            common: { name: 'alive', type: 'boolean' },
+            native: {},
+        };
+        ctx.states['system.adapter.admin.0.alive'] = { val: true, ack: true, ts: 1_750_000_000_000 };
+        ctx.states['system.adapter.vis.0.alive'] = { val: false, ack: true, ts: 1_700_000_000_000 };
+        ctx.states['system.adapter.vis.0.connected'] = { val: false, ack: true, ts: 1_700_000_000_000 };
+        ctx.states['javascript.0.scriptEnabled.__execute_1'] = { val: false, ack: true, ts: 1_700_000_000_000 };
+        ctx.states['system.adapter.hue.upload'] = { val: 0, ack: true, ts: 1_700_000_000_000 };
+    });
+
+    afterEach(async () => {
+        await ctx.mcp.close();
+    });
+
+    it('deletes the states without object of patterns and IDs', async () => {
+        const data = await callOk(ctx.mcp, 'delete_orphan_states', {
+            ids: ['system.adapter.vis.0.*', 'javascript.0.scriptEnabled.__execute_1', 'system.adapter.vis.0.alive'],
+        });
+        assert.deepEqual(data.deleted, [
+            'javascript.0.scriptEnabled.__execute_1',
+            'system.adapter.vis.0.alive',
+            'system.adapter.vis.0.connected',
+        ]);
+        assert.deepEqual(data.skipped, []);
+        assert.equal(data.failed, undefined);
+        for (const id of data.deleted) {
+            assert.equal(ctx.states[id], undefined, `${id} was not deleted`);
+        }
+    });
+
+    it('never deletes a state with object or the upload progress', async () => {
+        const data = await callOk(ctx.mcp, 'delete_orphan_states', {
+            ids: ['system.adapter.admin.0.alive', 'system.adapter.hue.upload', 'system.adapter.nope.0.alive'],
+        });
+        assert.deepEqual(data.deleted, []);
+        assert.deepEqual(
+            data.skipped.map(entry => entry.id),
+            ['system.adapter.admin.0.alive', 'system.adapter.hue.upload', 'system.adapter.nope.0.alive'],
+        );
+        assert.match(data.skipped[0].reason, /has an object/);
+        assert.match(data.skipped[2].reason, /no such state/);
+        assert.ok(ctx.states['system.adapter.admin.0.alive']);
+        assert.ok(ctx.states['system.adapter.hue.upload']);
+
+        // a pattern only selects the states without object
+        const all = await callOk(ctx.mcp, 'delete_orphan_states', { ids: ['system.adapter.*'] });
+        assert.ok(all.deleted.includes('system.adapter.vis.0.alive'));
+        assert.ok(!all.deleted.includes('system.adapter.admin.0.alive'));
+        assert.ok(!all.deleted.includes('system.adapter.hue.upload'));
+        assert.ok(ctx.states['system.adapter.admin.0.alive']);
+        assert.ok(ctx.states['system.adapter.hue.upload']);
+    });
+
+    it('skips a state whose object was created meanwhile', async () => {
+        const getObject = ctx.adapter.getForeignObjectAsync;
+        let reads = 0;
+        // the object appears after the selection, e.g. while the user confirms
+        ctx.adapter.getForeignObjectAsync = (id, options) => {
+            if (id === 'system.adapter.vis.0.alive' && ++reads > 1) {
+                return Promise.resolve({ _id: id, type: 'state', common: {}, native: {} });
+            }
+            return getObject(id, options);
+        };
+        const data = await callOk(ctx.mcp, 'delete_orphan_states', { ids: ['system.adapter.vis.0.alive'] });
+        assert.deepEqual(data.deleted, []);
+        assert.deepEqual(data.skipped, [
+            { id: 'system.adapter.vis.0.alive', reason: 'The state got an object meanwhile' },
+        ]);
+        assert.ok(ctx.states['system.adapter.vis.0.alive']);
+    });
+});
+
 describe('log of the tool calls', () => {
     let ctx;
 
@@ -1709,6 +1790,22 @@ describe('prompts and confirmations', () => {
             const result = await ctx.client.callTool({ name: 'delete_object', arguments: { id: 'hue.0.light' } });
             assert.equal(result.isError, undefined);
             assert.equal(ctx.mock.objects['hue.0.light'], undefined);
+        } finally {
+            await ctx.close();
+        }
+    });
+
+    it('asks before deleting states without object and names them', async () => {
+        const ctx = await connect({ action: 'decline' });
+        ctx.mock.states['system.adapter.vis.0.alive'] = { val: false, ack: true, ts: 1_700_000_000_000 };
+        try {
+            const result = await ctx.client.callTool({
+                name: 'delete_orphan_states',
+                arguments: { ids: ['system.adapter.vis.0.*'] },
+            });
+            assert.equal(result.isError, true);
+            assert.match(ctx.asked[0], /^Delete 1 state\(s\) without object: system\.adapter\.vis\.0\.alive\?$/);
+            assert.ok(ctx.mock.states['system.adapter.vis.0.alive'], 'deleted although declined');
         } finally {
             await ctx.close();
         }

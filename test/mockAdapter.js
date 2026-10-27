@@ -344,6 +344,10 @@ function createMockAdapter() {
             states[id] = { val: value, ack: !!ack, ts: Date.now() };
             return Promise.resolve();
         },
+        delForeignStateAsync(id) {
+            delete states[id];
+            return Promise.resolve();
+        },
         getHistoryAsync(id) {
             return Promise.resolve({
                 result: [

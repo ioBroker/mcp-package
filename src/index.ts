@@ -85,6 +85,7 @@ const TOOL_RIGHTS: Record<string, (rights: Rights) => boolean> = {
     create_scene: objectWrite,
     create_alias: objectWrite,
     delete_object: rights => !!rights.object?.delete,
+    delete_orphan_states: rights => !!rights.state?.delete,
     write_file: fileWrite,
     rename_file: fileWrite,
     mkdir: fileWrite,
@@ -117,6 +118,22 @@ const STATE_POLL_INTERVAL = 250;
  * no orphan.
  */
 const UPLOAD_STATE = /^system\.adapter\.[^.]+\.upload$/;
+/** How many IDs the confirmation of `delete_orphan_states` names. */
+const CONFIRM_ID_COUNT = 10;
+
+/** A state without object, as `find_orphan_states` reports it. */
+interface OrphanState {
+    id: string;
+    val?: ioBroker.StateValue;
+    ack?: boolean;
+    ts?: number;
+    from?: string;
+}
+/** An ID that `delete_orphan_states` did not delete, and why. */
+interface SkippedState {
+    id: string;
+    reason: string;
+}
 
 const LOOPBACK = new net.BlockList();
 LOOPBACK.addSubnet('127.0.0.0', 8, 'ipv4');
@@ -1482,6 +1499,9 @@ export default class McpServer {
             },
         );
 
+        const orphanDeletion = this.config.allowObjectChange
+            ? 'Delete the found states with delete_orphan_states.'
+            : 'Found states can be deleted on the host with `iobroker state del <id>`.';
         server.registerTool(
             'find_orphan_states',
             {
@@ -1493,8 +1513,7 @@ export default class McpServer {
                     'read their old values. `pattern` selects the states to check, e.g. "system.adapter.*" or ' +
                     '"hue.0.*"; "*" checks all states and objects, which takes a while on large installations. ' +
                     'The upload progress of the adapters ("system.adapter.<adapter>.upload") is not reported: ' +
-                    'js-controller writes it without object on purpose. ' +
-                    'Found states can be deleted on the host with `iobroker state del <id>`.',
+                    `js-controller writes it without object on purpose. ${orphanDeletion}`,
                 inputSchema: {
                     pattern: z
                         .string()
@@ -2227,6 +2246,55 @@ export default class McpServer {
                         await confirm(`Delete the object "${id}"${recursive ? ' and all its children' : ''}?`);
                         await this.deleteObject(id, recursive);
                         return ok({ ok: true, data: { id, deleted: true } });
+                    } catch (e) {
+                        return fail(e);
+                    }
+                },
+            );
+
+            server.registerTool(
+                'delete_orphan_states',
+                {
+                    title: 'Delete states without object',
+                    annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: true,
+                        idempotentHint: true,
+                        openWorldHint: false,
+                    },
+                    description:
+                        'Delete states that have no object, as found by find_orphan_states, e.g. the states left ' +
+                        'over from a deleted instance. `ids` are the IDs of the states, or patterns with "*" whose ' +
+                        'states without object are all deleted, e.g. "system.adapter.vis.0.*". Every state is ' +
+                        'checked again before it is deleted: a state with an object and the upload progress of an ' +
+                        'adapter are skipped, so this tool never deletes the value of an existing state.',
+                    inputSchema: {
+                        ids: z
+                            .array(z.string().min(1))
+                            .min(1)
+                            .describe('IDs of the states without object, wildcards "*" allowed'),
+                    },
+                },
+                async ({ ids }) => {
+                    try {
+                        const selected = await this.selectOrphanStates(ids);
+                        if (selected.orphans.length) {
+                            const more = selected.orphans.length - CONFIRM_ID_COUNT;
+                            await confirm(
+                                `Delete ${selected.orphans.length} state(s) without object: ` +
+                                    `${selected.orphans.slice(0, CONFIRM_ID_COUNT).join(', ')}` +
+                                    `${more > 0 ? ` and ${more} more` : ''}?`,
+                            );
+                        }
+                        const { deleted, skipped, failed } = await this.deleteOrphanStates(selected.orphans);
+                        return ok({
+                            ok: true,
+                            data: {
+                                deleted,
+                                skipped: [...selected.skipped, ...skipped],
+                                ...(failed.length ? { failed } : {}),
+                            },
+                        });
                     } catch (e) {
                         return fail(e);
                     }
@@ -4212,7 +4280,7 @@ export default class McpServer {
      * @param pattern IDs of the states to check, wildcards allowed
      * @returns how many states were checked, and the states without object
      */
-    private async findOrphanStates(pattern: string): Promise<{ checked: number; orphans: Record<string, unknown>[] }> {
+    private async findOrphanStates(pattern: string): Promise<{ checked: number; orphans: OrphanState[] }> {
         // not a literal argument: the types of the adapter do not know `maintenance`
         const maintenance = { user: 'system.user.admin', maintenance: true } as const;
         const states = await this.adapter.getForeignStatesAsync(pattern, maintenance);
@@ -4223,7 +4291,7 @@ export default class McpServer {
             endkey: `${prefix}香`,
         });
         const objects = new Set(view.rows.map(row => row.id));
-        const orphans: Record<string, unknown>[] = [];
+        const orphans: OrphanState[] = [];
         for (const id of Object.keys(states).sort()) {
             // the rare state of an object of another type is no orphan either
             if (UPLOAD_STATE.test(id) || objects.has(id) || (await this.adapter.getForeignObjectAsync(id))) {
@@ -4233,6 +4301,61 @@ export default class McpServer {
             orphans.push({ id, val: state?.val, ack: state?.ack, ts: state?.ts, from: state?.from });
         }
         return { checked: Object.keys(states).length, orphans };
+    }
+
+    /**
+     * The states without object among the given IDs, for deleting them. A pattern selects its states without object
+     * like {@link findOrphanStates}; an ID without wildcard is skipped, with the reason, if it is no such state.
+     *
+     * @param ids IDs of the states, wildcards allowed
+     * @returns the sorted IDs of the states without object, and the skipped IDs
+     */
+    private async selectOrphanStates(ids: string[]): Promise<{ orphans: string[]; skipped: SkippedState[] }> {
+        const orphans = new Set<string>();
+        const skipped: SkippedState[] = [];
+        for (const id of ids) {
+            if (id.includes('*')) {
+                for (const orphan of (await this.findOrphanStates(id)).orphans) {
+                    orphans.add(orphan.id);
+                }
+            } else if (UPLOAD_STATE.test(id)) {
+                skipped.push({ id, reason: 'The upload progress of an adapter has no object on purpose' });
+            } else if (await this.adapter.getForeignObjectAsync(id)) {
+                skipped.push({ id, reason: 'The state has an object' });
+            } else if (!(await this.adapter.getForeignStateAsync(id))) {
+                skipped.push({ id, reason: 'There is no such state' });
+            } else {
+                orphans.add(id);
+            }
+        }
+        return { orphans: [...orphans].sort(), skipped };
+    }
+
+    /**
+     * Delete states without object. Each one is checked once more right before, as an adapter may have created its
+     * object meanwhile, e.g. while the user was asked for confirmation.
+     *
+     * @param ids IDs of the states without object
+     */
+    private async deleteOrphanStates(
+        ids: string[],
+    ): Promise<{ deleted: string[]; skipped: SkippedState[]; failed: { id: string; error: string }[] }> {
+        const deleted: string[] = [];
+        const skipped: SkippedState[] = [];
+        const failed: { id: string; error: string }[] = [];
+        for (const id of ids) {
+            try {
+                if (await this.adapter.getForeignObjectAsync(id)) {
+                    skipped.push({ id, reason: 'The state got an object meanwhile' });
+                    continue;
+                }
+                await this.adapter.delForeignStateAsync(id, { user: this.user });
+                deleted.push(id);
+            } catch (e) {
+                failed.push({ id, error: e instanceof Error ? e.message : String(e) });
+            }
+        }
+        return { deleted, skipped, failed };
     }
 
     /** Coerce an arbitrary value to the given ioBroker state type. */

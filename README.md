@@ -167,7 +167,8 @@ MCP session runs as (the logged-in user, or the Default User without authenticat
 
 A session is not even offered the tools that need a right the groups of its user lack: without the write right for
 states no `set_state`/`set_states`, without the write right for objects no `set_object`, `create_state`,
-`start_instance`, ..., without the write right for files no `write_file`, without **execute** no `install_package`,
+`start_instance`, ..., without the delete right for states no `delete_orphan_states`, without the write right for
+files no `write_file`, without **execute** no `install_package`,
 without **sendto** no `send_to`. The rights are read when the session starts; every call is checked anyway.
 
 `check_permissions` shows these rights and the ACLs of given objects.
@@ -200,7 +201,7 @@ Point your MCP client at:
 |-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `get_states`                | Retrieve the current value of one or multiple states; IDs may contain wildcards (e.g. `hue.0.*.brightness`); an ID without a state is returned with `exists: false` or a hint                                                                      |
 | `wait_for_state`            | Wait until a state has a `value` (or, without `value`, until it is updated), optionally only with `ack`; gives up after `timeout` seconds (default 30, at most 50) with `reached: false`                                                             |
-| `find_orphan_states`        | Find states without object (e.g. `system.adapter.vis.0.alive` of a deleted instance) by an ID `pattern`, except the upload progress `system.adapter.<adapter>.upload`, which has no object on purpose; delete them on the host with `iobroker state del <id>`|
+| `find_orphan_states`        | Find states without object (e.g. `system.adapter.vis.0.alive` of a deleted instance) by an ID `pattern`, except the upload progress `system.adapter.<adapter>.upload`, which has no object on purpose; delete them with `delete_orphan_states` or on the host with `iobroker state del <id>`|
 | `get_object`                | Read a single object by its ID                                                                                                                                                                                                                       |
 | `check_permissions`         | Show the user and groups of the MCP session, the rights of its groups and, for given object IDs, whether it may read/write/delete the object and read/write the state                                                                               |
 | `search_objects`            | Search objects/states by keyword (matched against ID and name); optional filters for object `type`, `role`, `room` and source `adapter` instance                                                                                                     |
@@ -228,6 +229,7 @@ Point your MCP client at:
 | `clear_notifications`       | Acknowledge system notifications, optionally of one scope/category/instance — requires *Allow setting states*                                                                                                                                        |
 | `set_object`                | Create/update an object (merges common/native) — requires *Allow object/file changes*                                                                                                                                                                |
 | `delete_object`             | Delete an object, optionally with all children — requires *Allow object/file changes*                                                                                                                                                                |
+| `delete_orphan_states`      | Delete states without object, given by their IDs or by patterns like `system.adapter.vis.0.*`; each state is checked again first, so a state with an object and the upload progress of an adapter are never deleted — requires *Allow object/file changes* |
 | `create_state`              | Create a new state object with type/role/unit/min/max and optional initial value — requires *Allow object/file changes*                                                                                                                              |
 | `create_scene`              | Create or update a scene for the ioBroker `scenes` adapter (state/value pairs applied together) — requires *Allow object/file changes*                                                                                                               |
 | `create_alias`              | Create an alias (`alias.0.*`) pointing to a state, optionally with a separate write state — requires *Allow object/file changes*                                                                                                                     |
@@ -335,6 +337,9 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+* (@GermanBluefox) Added the `delete_orphan_states` tool: deletes the states without object found by `find_orphan_states`, but never a state with an object
+
 ### 1.8.1 (2026-10-26)
 * (@GermanBluefox) `find_orphan_states` no longer reports the upload progress of the adapters (`system.adapter.<adapter>.upload`), which js-controller writes without object on purpose
 

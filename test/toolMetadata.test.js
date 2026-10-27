@@ -20,6 +20,7 @@ const ALL_TOOLS = [
     'delete_file',
     'delete_instance',
     'delete_object',
+    'delete_orphan_states',
     'delete_script',
     'enable_script',
     'file_exists',
@@ -73,6 +74,7 @@ const SET_STATE_TOOLS = ['set_state', 'set_states'];
 const OBJECT_CHANGE_TOOLS = [
     'set_object',
     'delete_object',
+    'delete_orphan_states',
     'create_state',
     'create_scene',
     'create_alias',
