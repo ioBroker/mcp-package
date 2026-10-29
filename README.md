@@ -337,7 +337,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.9.1 (2026-10-29)
 * (@GermanBluefox) `list_devices`: a name (`smartName` without `smartType`) on one state of a detected device now names that device instead of splitting the state off as a device of its own without room, without the other states (e.g. the switch next to the level) and with a guessed type. Named states that stay devices of their own now get the room and function of their channel or device too
 
 ### 1.9.0 (2026-10-27)
