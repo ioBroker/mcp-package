@@ -322,17 +322,43 @@ export async function controls(
         }
     });
 
+    /**
+     * The room and the function of a control: those of the object itself, else those of its channel or device
+     * (e.g. an alias state under a channel that carries the room assignment).
+     *
+     * @param id ID of the control's object
+     */
+    const placeOf = (id: string): { room?: ioBroker.EnumObject; functionality?: ioBroker.EnumObject } => {
+        const ids = [id, getChannelId(id, devicesObject), getDeviceId(id, devicesObject)].filter(
+            (i): i is string => !!i,
+        );
+        const find = (enums: ioBroker.EnumObject[]): ioBroker.EnumObject | undefined => {
+            for (const i of ids) {
+                const found = enums.find(e => e?.common?.members?.includes(i));
+                if (found) {
+                    return found;
+                }
+            }
+            return undefined;
+        };
+        return { room: find(rooms), functionality: find(functionalities) };
+    };
+
     // collect first all smart names and remove them from the auto-groups
     const detectedControls: IotExternalPatternControl[] = [];
     const detector = new ChannelDetector();
 
     const patterns = ChannelDetector.getPatterns();
-    // process states with defined smartName
-    for (let s = 0; s < idsWithSmartName.length; s++) {
-        const id = idsWithSmartName[s];
-        const common = devicesObject[id].common;
-        const smartName = getSmartNameFromObj(devicesObject[id], adapter.namespace) as SmartNameObject;
 
+    /**
+     * A device of its own for a state with a smartName: the state is the required state of the pattern of
+     * `smartType` (default: boolean → socket, number → dimmer).
+     *
+     * @param id ID of the state
+     * @param smartName its smartName
+     */
+    const addNamedControl = (id: string, smartName: SmartNameObject): void => {
+        const common = devicesObject[id].common;
         // try to convert the state to typeDetector format
         // "smartName": {
         //    "de": "Rote Lampe",
@@ -354,61 +380,90 @@ export async function controls(
             }
         }
         // try to simulate typeDetector format
-        if (patterns[smartName.smartType]) {
-            const control: IotExternalPatternControl = JSON.parse(JSON.stringify(patterns[smartName.smartType]));
-            // find first required
-            const state = control.states.find(state => state.required);
-            if (state) {
-                state.id = id;
-                // process control
-                // remove all unassigned control register
-                control.states = control.states.filter(s => s.id);
+        if (!patterns[smartName.smartType]) {
+            return;
+        }
+        const control: IotExternalPatternControl = JSON.parse(JSON.stringify(patterns[smartName.smartType]));
+        // find first required
+        const state = control.states.find(state => state.required);
+        if (!state) {
+            return;
+        }
+        state.id = id;
+        // process control
+        // remove all unassigned control register
+        control.states = control.states.filter(s => s.id);
 
-                // take all smartNames if any
-                control.states.forEach(s => {
-                    s.smartName = getSmartNameFromObj(devicesObject[s.id], adapter.namespace);
-                    s.common = {
-                        min: devicesObject[s.id]?.common?.min,
-                        max: devicesObject[s.id]?.common?.max,
-                        type: devicesObject[s.id]?.common?.type,
-                        states: devicesObject[s.id]?.common?.states,
-                        unit: devicesObject[s.id]?.common?.unit,
-                        role: devicesObject[s.id]?.common?.role,
-                        name: devicesObject[s.id]?.common?.name,
-                        icon: devicesObject[s.id]?.common?.icon,
-                        color: devicesObject[s.id]?.common?.color,
-                    };
-                });
+        // take all smartNames if any
+        control.states.forEach(s => {
+            s.smartName = getSmartNameFromObj(devicesObject[s.id], adapter.namespace);
+            s.common = {
+                min: devicesObject[s.id]?.common?.min,
+                max: devicesObject[s.id]?.common?.max,
+                type: devicesObject[s.id]?.common?.type,
+                states: devicesObject[s.id]?.common?.states,
+                unit: devicesObject[s.id]?.common?.unit,
+                role: devicesObject[s.id]?.common?.role,
+                name: devicesObject[s.id]?.common?.name,
+                icon: devicesObject[s.id]?.common?.icon,
+                color: devicesObject[s.id]?.common?.color,
+            };
+        });
 
-                devicesObject[id].common.smartName = smartName;
+        devicesObject[id].common.smartName = smartName;
 
-                control.object = {
-                    id,
-                    type: devicesObject[id].type,
-                    common: devicesObject[id].common,
-                    autoDetected: false,
-                    toggle: smartName?.toggle,
-                };
+        control.object = {
+            id,
+            type: devicesObject[id].type,
+            common: devicesObject[id].common,
+            autoDetected: false,
+            toggle: smartName?.toggle,
+        };
 
-                // remove id from the groups
-                let pos = list.indexOf(id);
-                if (pos !== -1) {
-                    list.splice(pos, 1);
-                }
-                const channelId = getChannelId(id, devicesObject);
-                if (channelId) {
-                    pos = list.indexOf(channelId);
-                    if (pos !== -1) {
-                        list.splice(pos, 1);
-                    }
-                }
-
-                const name = smartName[lang] || smartName.en || smartName.de;
-                control.groupNames = name?.split(',').map(n => n.trim()) || [];
-
-                detectedControls.push(control);
+        // remove id from the groups
+        let pos = list.indexOf(id);
+        if (pos !== -1) {
+            list.splice(pos, 1);
+        }
+        const channelId = getChannelId(id, devicesObject);
+        if (channelId) {
+            pos = list.indexOf(channelId);
+            if (pos !== -1) {
+                list.splice(pos, 1);
             }
         }
+
+        const name = smartName[lang] || smartName.en || smartName.de;
+        control.groupNames = name?.split(',').map(n => n.trim()) || [];
+
+        const { room, functionality } = placeOf(id);
+        control.room = room ? { id: room._id, common: room.common } : undefined;
+        control.functionality = functionality ? { id: functionality._id, common: functionality.common } : undefined;
+
+        detectedControls.push(control);
+    };
+
+    // A smartName without a smartType on a state of a channel or device that is detected anyway only names the
+    // detected device (e.g. a name for an alias light written on one of its states). As a device of its own, the
+    // state would take the place of the whole channel: the switch next to the level would be lost, and so would
+    // the type of the device.
+    const namingStates: string[] = [];
+    // process states with defined smartName
+    for (const id of idsWithSmartName) {
+        const smartName = getSmartNameFromObj(devicesObject[id], adapter.namespace) as SmartNameObject;
+        if (!smartName.smartType && devicesObject[id].type === 'state') {
+            const channelId = getChannelId(id, devicesObject);
+            const deviceId = getDeviceId(id, devicesObject);
+            if (
+                list.includes(id) ||
+                (channelId && channelId !== id && list.includes(channelId)) ||
+                (deviceId && list.includes(deviceId))
+            ) {
+                namingStates.push(id);
+                continue;
+            }
+        }
+        addNamedControl(id, smartName);
     }
 
     // initialize iobroker type detector
@@ -452,11 +507,6 @@ export async function controls(
                     };
                 });
 
-                // find out the room the found control is in; if the state itself is not a member of any
-                // room, fall back to its channel or device parent (e.g. an alias state under a channel
-                // that carries the room assignment).
-                const parentChannelId = getChannelId(id, devicesObject);
-                const parentDeviceId = getDeviceId(id, devicesObject);
                 // For alias devices the state name is often generic (e.g. "SET"); prefer the name of the
                 // immediate enclosing alias channel/device (cf. ioBroker.iot getObjectName on the channel/
                 // device object). Falls back to the state's own name below.
@@ -465,20 +515,7 @@ export async function controls(
                     aliasParent && (aliasParent.type === 'channel' || aliasParent.type === 'device')
                         ? aliasParent.common?.name
                         : undefined;
-                const room =
-                    rooms.find(r => r?.common?.members?.includes(id)) ||
-                    (parentChannelId ? rooms.find(r => r?.common?.members?.includes(parentChannelId)) : undefined) ||
-                    (parentDeviceId ? rooms.find(r => r?.common?.members?.includes(parentDeviceId)) : undefined);
-
-                // find out the functionality the found control is assigned to (same parent fallback)
-                const functionality =
-                    functionalities.find(f => f?.common?.members?.includes(id)) ||
-                    (parentChannelId
-                        ? functionalities.find(f => f?.common?.members?.includes(parentChannelId))
-                        : undefined) ||
-                    (parentDeviceId
-                        ? functionalities.find(f => f?.common?.members?.includes(parentDeviceId))
-                        : undefined);
+                const { room, functionality } = placeOf(id);
 
                 const smartName = getSmartNameFromObj(devicesObject[id], adapter.namespace);
                 iotControl.object = {
@@ -517,6 +554,20 @@ export async function controls(
             }
         });
     });
+
+    for (const id of namingStates) {
+        const smartName = getSmartNameFromObj(devicesObject[id], adapter.namespace) as SmartNameObject;
+        const control = detectedControls.find(c => c.object?.autoDetected && c.states.some(s => s.id === id));
+        if (!control) {
+            // the detector did not take the state into any device: it stays a device of its own
+            addNamedControl(id, smartName);
+            continue;
+        }
+        const name = smartName[lang] || smartName.en || smartName.de;
+        if (name && !control.groupNames?.length) {
+            control.groupNames = name.split(',').map(n => n.trim());
+        }
+    }
 
     return detectedControls;
 }

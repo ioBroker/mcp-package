@@ -171,6 +171,48 @@ describe('reading tools', () => {
         assert.deepEqual(filtered.rooms, []);
     });
 
+    it('list_devices: a name on one state of a detected device names that device', async () => {
+        // a name without a smartType on the level: the light keeps its switch, its type and its room
+        ctx.objects['hue.0.light.brightness'].common.smartName = { ru: 'Свет', de: 'Küchenlicht' };
+        const data = await callOk(ctx.mcp, 'list_devices', { language: 'ru' });
+        assert.equal(data.rooms.length, 1);
+        assert.notEqual(data.rooms[0].roomName, 'No room');
+        assert.equal(data.rooms[0].devicesInRoom.length, 1);
+        const device = data.rooms[0].devicesInRoom[0];
+        assert.equal(device.deviceType, 'dimmer');
+        assert.equal(device.controls.ON_SET.stateId, 'hue.0.light.state');
+        assert.deepEqual(device.friendlyDeviceNames, ['Свет']);
+    });
+
+    it('list_devices: a named state outside any detected device is a device of its own, in its room', async () => {
+        ctx.objects['enum.rooms.kitchen'] = {
+            _id: 'enum.rooms.kitchen',
+            type: 'enum',
+            common: { name: { en: 'Kitchen' }, members: ['javascript.0.oven'] },
+            native: {},
+        };
+        ctx.objects['javascript.0.oven'] = {
+            _id: 'javascript.0.oven',
+            type: 'state',
+            common: { name: 'oven', type: 'number', role: 'level', read: true, write: true, smartName: { en: 'Oven' } },
+            native: {},
+        };
+        const data = await callOk(ctx.mcp, 'list_devices', { room: 'Kitchen' });
+        assert.equal(data.rooms.length, 1);
+        const device = data.rooms[0].devicesInRoom[0];
+        assert.deepEqual(device.friendlyDeviceNames, ['Oven']);
+        assert.equal(device.deviceType, 'dimmer');
+    });
+
+    it('list_devices: a name with a smartType still makes a device of its own, in the room of its channel', async () => {
+        ctx.objects['hue.0.light.state'].common.smartName = { en: 'Lamp switch', smartType: 'socket' };
+        const data = await callOk(ctx.mcp, 'list_devices', {});
+        const devices = data.rooms.flatMap(room => room.devicesInRoom);
+        const named = devices.find(device => device.friendlyDeviceNames?.includes('Lamp switch'));
+        assert.ok(named, 'named device missing');
+        assert.equal(named.room, 'Living room');
+    });
+
     it('history_query returns the recorded values', async () => {
         const data = await callOk(ctx.mcp, 'history_query', {
             id: 'hue.0.light.brightness',
