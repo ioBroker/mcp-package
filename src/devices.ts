@@ -159,13 +159,9 @@ async function functionalitiesAndRooms(
     options?: ReadOptions,
 ): Promise<[ioBroker.EnumObject[], ioBroker.EnumObject[]]> {
     const enumerations = await allEnums(adapter, options);
-    // skip empty enums (with no members, i.e. states, assigned)
-    const notEmptyRoomsAndFunctionalities = enumerations
-        .filter(item => {
-            const smartName = getSmartNameFromObj(item, adapter.namespace);
-            return smartName !== false;
-        })
-        .filter(item => item?.common?.members?.length);
+    // skip empty enums (with no members, i.e. states, assigned). An enum with `smartName: false` is only hidden
+    // from the smart home (iot): it is still the room of its devices, and without it they had no room at all.
+    const notEmptyRoomsAndFunctionalities = enumerations.filter(item => item?.common?.members?.length);
     // all enums that are of type 'function'
     const functionalities = notEmptyRoomsAndFunctionalities.filter(item => isFunctionality(item));
     // all enums, that are of type 'room'

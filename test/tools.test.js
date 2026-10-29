@@ -213,6 +213,13 @@ describe('reading tools', () => {
         assert.equal(named.room, 'Living room');
     });
 
+    it('list_devices: a room hidden from the smart home (smartName false) is still the room of its devices', async () => {
+        ctx.objects['enum.rooms.living_room'].common.smartName = false;
+        const data = await callOk(ctx.mcp, 'list_devices', {});
+        assert.equal(data.rooms.length, 1);
+        assert.equal(data.rooms[0].roomName, 'Living room');
+    });
+
     it('history_query returns the recorded values', async () => {
         const data = await callOk(ctx.mcp, 'history_query', {
             id: 'hue.0.light.brightness',
