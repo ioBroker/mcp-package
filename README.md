@@ -337,7 +337,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.9.2 (2026-10-29)
 * (@GermanBluefox) `list_devices`: a room or function hidden from the smart home (`smartName: false`) is still the room or function of its devices; before, its devices were listed without room
 
 ### 1.9.1 (2026-10-29)
