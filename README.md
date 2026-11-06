@@ -202,7 +202,7 @@ Point your MCP client at:
 | `get_states`                | Retrieve the current value of one or multiple states; IDs may contain wildcards (e.g. `hue.0.*.brightness`); an ID without a state is returned with `exists: false` or a hint                                                                      |
 | `wait_for_state`            | Wait until a state has a `value` (or, without `value`, until it is updated), optionally only with `ack`; gives up after `timeout` seconds (default 30, at most 50) with `reached: false`                                                             |
 | `find_orphan_states`        | Find states without object (e.g. `system.adapter.vis.0.alive` of a deleted instance) by an ID `pattern`, except the upload progress `system.adapter.<adapter>.upload`, which has no object on purpose; delete them with `delete_orphan_states` or on the host with `iobroker state del <id>`|
-| `get_object`                | Read a single object by its ID                                                                                                                                                                                                                       |
+| `get_object`                | Read a single object by its ID; optional `offset`/`length`/`sha256` for verified, base64 JSON chunks                                                                                                                                                                                                                       |
 | `check_permissions`         | Show the user and groups of the MCP session, the rights of its groups and, for given object IDs, whether it may read/write/delete the object and read/write the state                                                                               |
 | `search_objects`            | Search objects/states by keyword (matched against ID and name); optional filters for object `type`, `role`, `room` and source `adapter` instance                                                                                                     |
 | `list_devices`              | List detected devices grouped by room (uses the ioBroker type-detector to expose functional devices with named controls); optional `language` and `room` filter                                                                                      |
@@ -268,6 +268,21 @@ MCP clients reject tool results above 1 MiB, and a model cannot pass megabytes o
   `history_query`) return as many entries as fit and add `truncated`, `total`, `nextOffset` and a `hint`; call
   again with `offset` set to `nextOffset` for the next part. `get_logs` keeps the newest lines. Any other result
   that is too large is replaced by a download link, or by an error asking to narrow the request down.
+- **Large objects without transfer links**: call `get_object` with `{ "id": "script.js.example", "offset": 0 }`.
+  The response `data` contains `id`, `encoding: "base64"`, `content`, `size`, `offset`, `length`, `truncated`,
+  `sha256`, and `nextOffset` only if more bytes remain. These are bytes of the **entire object's UTF-8 JSON**,
+  not only `common.source`. The optional `length` is limited to 512 KiB, preserving the 900 KiB wire budget.
+  Continue at `nextOffset` with the same `id` and the first response's `sha256`. Every call rereads the object
+  with the session user's existing ACL. Changed or deleted objects, revoked access, missing continuation
+  hashes and invalid ranges fail; discard partial results on any error. No cache, extra rights, file mirror
+  or transfer endpoint is used. Calls without `offset` retain their original object/null response.
+  Clients must require contiguous offsets, consistent total size/hash, an explicit final chunk, and a matching
+  SHA-256 of all decoded bytes **before** parsing or exposing the object. See
+  [the read-only client example](examples/read-object-chunks.js). It can also compare `common.source` byte-for-byte
+  with independently obtained PRIMARY source bytes. A successfully transferred source may still differ from PRIMARY;
+  never infer runtime equality from package versions or a local fixture test.
+  Strict schema-pinning proxies need a separately reviewed, exact native release contract before exposing these arguments;
+  this draft does not relax those proxies or authorize deployment.
 - **Download links** (`download_url`): a cut list carries a link to all of its entries as JSON, and `read_file`
   with `download: true` returns a link to the whole file. Clients that can run shell commands (e.g. Claude Code)
   fetch it with `curl -o <file> "<download_url>"`.

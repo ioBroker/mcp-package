@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import net from 'node:net';
 import dns from 'node:dns';
@@ -25,6 +25,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { getAiFriendlyStructure, type Room } from './devices';
 import { iobUriParse } from './iob-uri';
+import { readWindow } from './readWindow';
 import { PERMISSION_KEYS, type McpConfig, type McpPermissions } from './types';
 import { createInProcessMcp } from './inProcessClient';
 import packageJson from '../package.json';
@@ -2017,13 +2018,66 @@ export default class McpServer {
             {
                 title: 'Read an object',
                 annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-                description: 'Read a single ioBroker object by its ID',
-                inputSchema: { id: z.string().describe('Object ID, e.g. system.adapter.admin.0 or hm-rpc.0.ABC') },
+                description:
+                    'Read a single ioBroker object by its ID. For large objects, set offset: 0 to read ' +
+                    'the complete JSON object as base64-encoded UTF-8 byte chunks (at most 512 KiB each). ' +
+                    'Continue at nextOffset, passing the returned sha256 on every subsequent call. ' +
+                    'Reject incomplete reads and verify the SHA-256 of all decoded bytes before parsing the JSON.',
+                inputSchema: {
+                    id: z.string().describe('Object ID, e.g. system.adapter.admin.0 or hm-rpc.0.ABC'),
+                    offset: z
+                        .number()
+                        .int()
+                        .min(0)
+                        .max(Number.MAX_SAFE_INTEGER)
+                        .optional()
+                        .describe('Byte offset in the serialized JSON object; 0 starts a chunked read'),
+                    length: z
+                        .number()
+                        .int()
+                        .min(1)
+                        .max(DEFAULT_MAX_READ_BYTES)
+                        .optional()
+                        .describe('Maximum bytes per chunk (default and maximum 512 KiB); requires offset'),
+                    sha256: z
+                        .string()
+                        .regex(/^[a-f0-9]{64}$/)
+                        .optional()
+                        .describe('SHA-256 returned by the first chunk; required when offset is greater than 0'),
+                },
             },
-            async ({ id }) => {
+            async ({ id, offset, length, sha256 }) => {
                 try {
+                    if (offset === undefined && (length !== undefined || sha256 !== undefined)) {
+                        throw new Error('length and sha256 require offset');
+                    }
+                    if (offset !== undefined && offset > 0 && sha256 === undefined) {
+                        throw new Error('Continuation requires sha256 from the first chunk');
+                    }
+                    // Recheck the current user's object ACL on EVERY chunk; no cached objects or transfer links.
                     const object = await this.adapter.getForeignObjectAsync(id, { user: this.user });
-                    return ok({ ok: true, data: { object: object ?? null } });
+                    if (offset === undefined) {
+                        return ok({ ok: true, data: { object: object ?? null } });
+                    }
+                    if (!object) {
+                        throw new Error('Object not found');
+                    }
+                    const buffer = Buffer.from(JSON.stringify(object), 'utf8');
+                    const digest = createHash('sha256').update(buffer).digest('hex');
+                    if (sha256 !== undefined && sha256 !== digest) {
+                        throw new Error('Object changed during chunked read; discard all chunks and restart');
+                    }
+                    if (offset >= buffer.length) {
+                        throw new Error('Object offset must be less than its size');
+                    }
+                    return ok({
+                        ok: true,
+                        data: {
+                            id,
+                            sha256: digest,
+                            ...readWindow(buffer, false, offset, length ?? DEFAULT_MAX_READ_BYTES),
+                        },
+                    });
                 } catch (e) {
                     return fail(e);
                 }
@@ -4438,41 +4492,7 @@ export default class McpServer {
         }
         const asText = !base64 && typeof file === 'string';
         const buffer = Buffer.isBuffer(file) ? file : Buffer.from(file);
-        const size = buffer.length;
-
-        let start = Math.min(Math.max(0, Math.floor(offset)), size);
-        let end = Math.min(start + Math.max(1, Math.floor(length)), size);
-        if (asText) {
-            // Never split a multibyte UTF-8 sequence: continuation bytes are 0b10xxxxxx.
-            const isContinuation = (i: number): boolean => (buffer[i] & 0xc0) === 0x80;
-            while (start < end && isContinuation(start)) {
-                start++;
-            }
-            while (end > start && end < size && isContinuation(end)) {
-                end--;
-            }
-            if (end === start && start < size) {
-                // `length` is smaller than one character: return at least that whole character to guarantee progress.
-                end = start + 1;
-                while (end < size && isContinuation(end)) {
-                    end++;
-                }
-            }
-        }
-
-        const chunk = buffer.subarray(start, end);
-        const truncated = end < size;
-        return {
-            path,
-            mimeType,
-            encoding: asText ? 'utf8' : 'base64',
-            content: chunk.toString(asText ? 'utf8' : 'base64'),
-            size,
-            offset: start,
-            length: chunk.length,
-            truncated,
-            ...(truncated ? { nextOffset: end } : {}),
-        };
+        return { path, mimeType, ...readWindow(buffer, asText, offset, length) };
     }
 
     /** Write a file to an adapter file storage. */
