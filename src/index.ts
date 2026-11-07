@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import net from 'node:net';
 import dns from 'node:dns';
@@ -25,6 +25,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { getAiFriendlyStructure, type Room } from './devices';
 import { iobUriParse } from './iob-uri';
+import { readWindow } from './readWindow';
 import { PERMISSION_KEYS, type McpConfig, type McpPermissions } from './types';
 import { createInProcessMcp } from './inProcessClient';
 import packageJson from '../package.json';
@@ -2017,13 +2018,68 @@ export default class McpServer {
             {
                 title: 'Read an object',
                 annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-                description: 'Read a single ioBroker object by its ID',
-                inputSchema: { id: z.string().describe('Object ID, e.g. system.adapter.admin.0 or hm-rpc.0.ABC') },
+                description:
+                    'Read a single ioBroker object by its ID. For the source of a large script use get_script ' +
+                    'with `offset`. Clients that can run code fetch an object too large for one answer in parts: ' +
+                    '`offset: 0`, then `offset: nextOffset` with the `sha256` of the first part until `truncated` ' +
+                    'is false; join the base64 parts and check their SHA-256 before parsing the JSON.',
+                inputSchema: {
+                    id: z.string().describe('Object ID, e.g. system.adapter.admin.0 or hm-rpc.0.ABC'),
+                    offset: z
+                        .number()
+                        .int()
+                        .min(0)
+                        .optional()
+                        .describe('Return the object JSON as base64 part from this byte on (0 for the first part)'),
+                    length: z
+                        .number()
+                        .int()
+                        .min(1)
+                        .max(DEFAULT_MAX_READ_BYTES)
+                        .optional()
+                        .describe(
+                            `Maximum bytes per part (default and at most ${DEFAULT_MAX_READ_BYTES}); needs offset`,
+                        ),
+                    sha256: z
+                        .string()
+                        .regex(/^[a-f0-9]{64}$/)
+                        .optional()
+                        .describe('The sha256 of the first part; needed for offset > 0 to detect a change in between'),
+                },
             },
-            async ({ id }) => {
+            async ({ id, offset, length, sha256 }) => {
                 try {
+                    if (offset === undefined && (length !== undefined || sha256 !== undefined)) {
+                        throw new Error('`length` and `sha256` need `offset`');
+                    }
+                    if (offset !== undefined && offset > 0 && sha256 === undefined) {
+                        throw new Error('Pass the `sha256` of the first part to read on from an `offset` above 0');
+                    }
+                    // Every part reads the object again with the rights of the session user, so a changed object
+                    // or withdrawn rights are noticed; nothing is cached between the calls.
                     const object = await this.adapter.getForeignObjectAsync(id, { user: this.user });
-                    return ok({ ok: true, data: { object: object ?? null } });
+                    if (offset === undefined) {
+                        return ok({ ok: true, data: { object: object ?? null } });
+                    }
+                    if (!object) {
+                        throw new Error(`Object "${id}" not found`);
+                    }
+                    const buffer = Buffer.from(JSON.stringify(object), 'utf8');
+                    const digest = createHash('sha256').update(buffer).digest('hex');
+                    if (sha256 !== undefined && sha256 !== digest) {
+                        throw new Error(`Object "${id}" changed since the first part: read it again from offset 0`);
+                    }
+                    if (offset >= buffer.length) {
+                        throw new Error(`\`offset\` must be less than the size of the object (${buffer.length} bytes)`);
+                    }
+                    return ok({
+                        ok: true,
+                        data: {
+                            id,
+                            sha256: digest,
+                            ...readWindow(buffer, false, offset, length ?? DEFAULT_MAX_READ_BYTES),
+                        },
+                    });
                 } catch (e) {
                     return fail(e);
                 }
@@ -2613,15 +2669,57 @@ export default class McpServer {
             {
                 title: 'Read a script',
                 annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-                description: 'Read a script of the javascript adapter including its source code',
+                description:
+                    'Read a script of the javascript adapter including its source code. A source too long for ' +
+                    'one answer is read in parts: set `offset` to 0, and while the result has `truncated: true`, ' +
+                    'call again with `offset` set to the returned `nextOffset`. `size` is the source size in bytes.',
                 inputSchema: {
                     id: z.string().describe('Script id, e.g. "script.js.common.lights" or "common.lights"'),
+                    offset: z
+                        .number()
+                        .int()
+                        .min(0)
+                        .optional()
+                        .describe('Return only a part of the source, from this byte on (0 for the first part)'),
+                    length: z
+                        .number()
+                        .int()
+                        .min(1)
+                        .optional()
+                        .describe(`Maximum number of source bytes to return (default ${DEFAULT_MAX_READ_BYTES})`),
                 },
             },
-            async ({ id }) => {
+            async ({ id, offset, length }) => {
                 try {
                     const script = await this.getScriptObject(id);
-                    return ok({ ok: true, data: this.scriptInfo(script.id, script.obj, true) });
+                    const info = this.scriptInfo(script.id, script.obj, true);
+                    if (offset === undefined && length === undefined) {
+                        return ok({ ok: true, data: info });
+                    }
+                    const source = Buffer.from(info.source as string, 'utf8');
+                    // Quotes and backslashes are escaped twice on the wire (up to 4 bytes each): halve the part
+                    // until it fits into a tool result
+                    let max = length ?? DEFAULT_MAX_READ_BYTES;
+                    for (;;) {
+                        const part = readWindow(source, true, offset ?? 0, max);
+                        const result = {
+                            ok: true,
+                            data: {
+                                ...info,
+                                source: part.content,
+                                size: part.size,
+                                offset: part.offset,
+                                length: part.length,
+                                truncated: part.truncated,
+                                ...(part.truncated ? { nextOffset: part.nextOffset } : {}),
+                            },
+                        };
+                        if (max <= 1 || wireSize(JSON.stringify(result)) <= MAX_RESULT_BYTES) {
+                            return ok(result);
+                        }
+                        // A part never splits a character, so it can be longer than `max`
+                        max = Math.floor(Math.min(max, part.length) / 2);
+                    }
                 } catch (e) {
                     return fail(e);
                 }
@@ -4438,41 +4536,7 @@ export default class McpServer {
         }
         const asText = !base64 && typeof file === 'string';
         const buffer = Buffer.isBuffer(file) ? file : Buffer.from(file);
-        const size = buffer.length;
-
-        let start = Math.min(Math.max(0, Math.floor(offset)), size);
-        let end = Math.min(start + Math.max(1, Math.floor(length)), size);
-        if (asText) {
-            // Never split a multibyte UTF-8 sequence: continuation bytes are 0b10xxxxxx.
-            const isContinuation = (i: number): boolean => (buffer[i] & 0xc0) === 0x80;
-            while (start < end && isContinuation(start)) {
-                start++;
-            }
-            while (end > start && end < size && isContinuation(end)) {
-                end--;
-            }
-            if (end === start && start < size) {
-                // `length` is smaller than one character: return at least that whole character to guarantee progress.
-                end = start + 1;
-                while (end < size && isContinuation(end)) {
-                    end++;
-                }
-            }
-        }
-
-        const chunk = buffer.subarray(start, end);
-        const truncated = end < size;
-        return {
-            path,
-            mimeType,
-            encoding: asText ? 'utf8' : 'base64',
-            content: chunk.toString(asText ? 'utf8' : 'base64'),
-            size,
-            offset: start,
-            length: chunk.length,
-            truncated,
-            ...(truncated ? { nextOffset: end } : {}),
-        };
+        return { path, mimeType, ...readWindow(buffer, asText, offset, length) };
     }
 
     /** Write a file to an adapter file storage. */
