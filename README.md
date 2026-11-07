@@ -343,7 +343,7 @@ client calls it and its result is verified:
     Placeholder for the next version (at the beginning of the line):
     ### **WORK IN PROGRESS**
 -->
-### **WORK IN PROGRESS**
+### 1.10.0 (2026-11-07)
 * (@MarcoHe85) `get_object` returns an object that is too large for one answer in base64 parts (`offset`, `length`), checked with SHA-256 (`sha256`), for clients that get no download links
 * (@GermanBluefox) `get_script` returns a long source in parts (`offset`, `length`), like `read_file`
 
